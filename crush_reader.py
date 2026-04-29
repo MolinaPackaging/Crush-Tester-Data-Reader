@@ -21,8 +21,11 @@ from __future__ import annotations
 
 import csv
 import ftplib
+import hashlib
 import math
+import os
 import re
+import sys
 import threading
 import tkinter as tk
 from datetime import datetime
@@ -37,7 +40,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
-__version__ = "3.1.0"
+__version__ = "3.2.0"
 
 # ---------------------------------------------------------------------------
 #  CONSTANTS
@@ -446,6 +449,7 @@ class FTPMonitor:
         password: str = DEFAULT_PASS,
         remote_dir: str = DEFAULT_REMOTE_DIR,
         poll_interval: float = DEFAULT_POLL_SECONDS,
+        load_existing: bool = False,
     ):
         self.host = host
         self.port = port
@@ -453,11 +457,12 @@ class FTPMonitor:
         self.password = password
         self.remote_dir = remote_dir
         self.poll_interval = poll_interval
+        self.load_existing = load_existing
         self._ftp: Optional[ftplib.FTP] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
-        self._file_sizes: dict[str, int] = {}
-        self._sizes_lock = threading.Lock()
+        self._file_hashes: dict[str, str] = {}
+        self._hashes_lock = threading.Lock()
         self.on_status_change: Optional[StatusCallback] = None
         self.on_sample_changed: Optional[BytesCallback] = None
         self.on_summary_changed: Optional[BytesCallback] = None
@@ -511,25 +516,25 @@ class FTPMonitor:
             self._log(f"Download error ({fn}): {e}")
             return None
 
-    def _file_size(self, fn: str) -> Optional[int]:
-        try:
-            return self._ftp.size(fn)
-        except (ftplib.all_errors, OSError):
-            return None
-
     def _check(self, fn: str) -> Optional[bytes]:
-        sz = self._file_size(fn)
-        if sz is None:
+        data = self._download(fn)
+        if data is None:
             return None
-        with self._sizes_lock:
-            prev = self._file_sizes.get(fn)
-            self._file_sizes[fn] = sz
+        h = hashlib.md5(data).hexdigest()
+        with self._hashes_lock:
+            prev = self._file_hashes.get(fn)
+            self._file_hashes[fn] = h
         if prev is None:
-            self._log(f"Baseline: {fn} ({sz} bytes)")
-            return self._download(fn)
-        if sz != prev:
-            self._log(f"Changed: {fn} ({prev} -> {sz} bytes)")
-            return self._download(fn)
+            # First time seeing this file after connect
+            if self.load_existing:
+                self._log(f"Initial load: {fn} ({len(data)} bytes)")
+                return data
+            else:
+                self._log(f"Baseline recorded: {fn} ({len(data)} bytes, skipped)")
+                return None
+        if h != prev:
+            self._log(f"Changed: {fn} ({len(data)} bytes)")
+            return data
         return None
 
     def _loop(self) -> None:
@@ -563,8 +568,8 @@ class FTPMonitor:
         if self.is_running():
             return
         self._stop_event.clear()
-        with self._sizes_lock:
-            self._file_sizes.clear()
+        with self._hashes_lock:
+            self._file_hashes.clear()
         self._thread = threading.Thread(
             target=self._loop, name="FTPMonitor", daemon=True)
         self._thread.start()
@@ -578,9 +583,9 @@ class FTPMonitor:
         self._set_status("Disconnected", False)
 
     def force_refresh(self) -> None:
-        with self._sizes_lock:
-            self._file_sizes.clear()
-        self._log("Forced refresh")
+        with self._hashes_lock:
+            self._file_hashes.clear()
+        self._log("Forced refresh — will re-download on next poll")
 
 
 # ---------------------------------------------------------------------------
@@ -599,12 +604,25 @@ COLORS = [
 #  GUI
 # ---------------------------------------------------------------------------
 
+def _resource_path(relative: str) -> str:
+    """Resolve a path that works both in dev and in a PyInstaller bundle."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
+
+
 class CrushReaderApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(f"ABB Crush Tester Data Reader  v{__version__}")
         self.root.geometry("1250x860")
         self.root.minsize(1050, 720)
+        # Window icon (taskbar + title bar)
+        ico = _resource_path("corrugated_crush_icon.ico")
+        if os.path.isfile(ico):
+            try:
+                self.root.iconbitmap(ico)
+            except tk.TclError:
+                pass  # non-Windows or unsupported format — skip gracefully
         self.monitor: Optional[FTPMonitor] = None
         self.output_dir: str = ""
         self.session: Optional[TestSession] = None
@@ -666,14 +684,20 @@ class CrushReaderApp:
         self.dir_label = ttk.Label(df, text="(not set)", foreground="gray")
         self.dir_label.pack(side=tk.LEFT, padx=4, fill=tk.X, expand=True)
         ttk.Button(df, text="Browse...", command=self._pick_dir, width=8).pack(side=tk.RIGHT)
+        self.load_existing_var = tk.BooleanVar(value=False)
+        cb_frame = ttk.Frame(frame)
+        cb_frame.grid(row=r+1, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
+        ttk.Checkbutton(cb_frame, text="Load last test on connect",
+                        variable=self.load_existing_var).pack(anchor=tk.W)
+
         bf = ttk.Frame(frame)
-        bf.grid(row=r+1, column=0, columnspan=2, sticky=tk.EW, pady=(8,0))
+        bf.grid(row=r+2, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
         self.connect_btn = ttk.Button(bf, text="Connect & Monitor", command=self._toggle_mon)
         self.connect_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.refresh_btn = ttk.Button(bf, text="Refresh", width=7, command=self._force_refresh, state=tk.DISABLED)
         self.refresh_btn.pack(side=tk.RIGHT, padx=(4,0))
         sf = ttk.Frame(frame)
-        sf.grid(row=r+2, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
+        sf.grid(row=r+3, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
         self.status_dot = tk.Canvas(sf, width=12, height=12, highlightthickness=0)
         self.status_dot.pack(side=tk.LEFT); self._draw_dot("gray")
         self.status_label = ttk.Label(sf, text="Not connected")
@@ -991,7 +1015,8 @@ class CrushReaderApp:
             return
         self.monitor = FTPMonitor(
             self.host_var.get(), port, self.user_var.get(),
-            self.pass_var.get(), self.dir_var.get(), poll)
+            self.pass_var.get(), self.dir_var.get(), poll,
+            load_existing=self.load_existing_var.get())
         self.monitor.on_status_change = self._update_status
         self.monitor.on_log = self._log
         self.monitor.on_sample_changed = self._on_ftp_sample
