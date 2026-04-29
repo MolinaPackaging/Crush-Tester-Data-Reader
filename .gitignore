@@ -35,3 +35,6 @@ Desktop.ini
 # PyInstaller
 *.manifest
 *.log
+
+# Vendor docs / large binaries
+*.pdf

@@ -40,8 +40,9 @@ from crush_reader import (  # noqa: E402
     sanitize_filename,
 )
 
-SAMPLE_XML_PATH = ROOT / "sample.xml"
-SUMMARY_XML_PATH = ROOT / "summary.xml"
+FIXTURES = Path(__file__).parent / "fixtures"
+SAMPLE_XML_PATH = FIXTURES / "sample.xml"
+SUMMARY_XML_PATH = FIXTURES / "summary.xml"
 
 
 # ---------------------------------------------------------------------------

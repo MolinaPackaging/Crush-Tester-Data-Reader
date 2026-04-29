@@ -43,15 +43,25 @@ python crush_reader.py
 
 ## Building the Executable
 
-You need a Windows machine with Python 3.8+ installed. The lab computer does **not** need Python.
+You need a Windows machine with Python 3.8+ installed. The lab computer does **not** need Python — it just runs the final `.exe`.
 
-1. Clone or copy this folder to the machine with Python.
+1. Clone or copy this folder to the machine that has Python.
 2. Double-click `build_exe.bat` (or run it from a terminal).
-3. Wait ~1–2 minutes. The script installs PyInstaller and matplotlib, then builds the .exe.
+3. Wait ~1–2 minutes. The script installs PyInstaller and matplotlib, then builds the executable.
 4. Find the result in `dist\CrushReader.exe` (~40–60 MB).
-5. Copy `CrushReader.exe` to the lab computer via USB or network.
+5. Copy `CrushReader.exe` to the lab computer via USB drive or network.
 
-See `HOW_TO_BUILD.txt` for troubleshooting.
+### Notes
+
+- The `.exe` is fully self-contained. No Python runtime needed on the target machine.
+- Windows SmartScreen may show a warning the first time the `.exe` runs because it isn't digitally signed. Click **More info → Run anyway**.
+- If antivirus flags the `.exe`, add an exception for it. PyInstaller executables are commonly flagged as false positives.
+
+### Troubleshooting
+
+- **"Python not found"** — make sure Python is on your `PATH`. Run `python --version` to verify. If it doesn't work, reinstall Python and check **Add to PATH**.
+- **Build errors about missing modules** — make sure `pip` works. Try `pip install matplotlib`.
+- **`.exe` crashes on the lab computer** — run it from a command prompt (`cmd` → `cd` to the folder → `CrushReader.exe`) to see the error message.
 
 ---
 
@@ -102,15 +112,141 @@ Equivalently: FCT = Peak Force / Area(m²) / 1000.
 
 ---
 
+## User Guide
+
+This section covers everyday use of the tool for lab technicians and students.
+
+### 1. Starting the application
+
+Double-click **CrushReader.exe** on the lab computer (or run `python crush_reader.py` if you have Python installed). The main window has four areas:
+
+- **Left panel** — FTP connection settings, test parameters, and a log.
+- **Top-right** — replicate table showing each sample collected.
+- **Middle-right** — session summary with statistics.
+- **Bottom-right** — force-displacement plot.
+
+### 2. Connecting to the crush tester
+
+Before connecting, make sure the lab computer is plugged into the crush tester via Ethernet cable.
+
+1. **Choose an output folder.** Click **Browse...** under "Save to:" and pick a folder where archived test data will be saved. This is required before connecting.
+2. **Check the connection settings.** The defaults (above) should work unless your machine has been reconfigured.
+3. **Click "Connect & Monitor."** The status dot turns green when connected. If it fails, check that the Ethernet cable is plugged in and the tester is powered on.
+
+Once connected, the tool polls the tester every 5 seconds. When you run a test on the machine, the tool will detect the new data within a few seconds.
+
+### 3. Running a test session
+
+A **session** groups multiple replicates of the same test so you can get summary statistics.
+
+**Starting a new session.** Click **New Session** (top-left) to open the session dialog:
+
+- **Project / Sample Name** — give the session a descriptive name (e.g., "C-flute ECT April 28"). If left blank, the tool auto-fills from the machine's program name.
+- **Test Type** — choose ECT, FCT, or Generic depending on what you're testing.
+
+Click **Start Session** to begin.
+
+**Collecting replicates.** Run tests on the crush tester as normal. Each time you complete a test, the tool will:
+
+1. Download the new `sample.xml` from the machine.
+2. Archive a timestamped copy in your output folder.
+3. Parse the force-displacement data.
+4. Compute the test-specific value (ECT, FCT, or peak force).
+5. Add the replicate to the table and update the plot.
+
+**Ending a session.** Click **New Session** to start a fresh one (you'll be prompted to export), or click **Export Summary CSV** to save the session data. Closing the application will also prompt you to export.
+
+### 4. Test types and parameters
+
+**ECT (Edge Crush Test)** — measures edge crush resistance in **kN/m**. Default parameter: specimen length in mm (typically 100 mm).
+
+**FCT (Flat Crush Test)** — measures flat crush resistance in **kPa**. Default parameter: specimen area in cm² (typically 100 cm² for a 10×10 cm specimen).
+
+**Generic** — reports peak load in **N** with no additional calculation. Use this when you just need the raw peak force.
+
+**Changing parameters after testing.** If specimen dimensions were entered incorrectly, you can fix them without re-running tests:
+
+- **All samples** — update the value in the "Test Parameters" panel and click **Apply to all**.
+- **One sample** — double-click the **Param** cell in the replicate table, type the new value, and press Enter.
+
+The computed values and statistics update immediately.
+
+### 5. Working with the replicate table
+
+The table shows one row per sample with these columns:
+
+| Column       | Description                                      |
+|--------------|--------------------------------------------------|
+| Plot         | ✓ = included in plot and statistics. Click to toggle. |
+| #            | Sample number (order collected).                  |
+| Sample ID    | ID from the machine.                              |
+| Sample No    | Replicate number from the machine.                |
+| Peak Force   | Maximum force recorded (N).                       |
+| Param        | Specimen dimension (length or area). Double-click to edit. |
+| Computed     | Calculated ECT, FCT, or peak force value.         |
+| Unit         | Unit of the computed value.                       |
+
+Click the **Plot** column for any sample to toggle it. Excluded samples are removed from the statistics and the graph — useful for discarding outliers without deleting data. Click any row to highlight that curve on the graph.
+
+### 6. Reading the plot
+
+The force-displacement plot shows all included samples overlaid with different colors.
+
+- **X-axis:** displacement in mm (zeroed at the force threshold).
+- **Y-axis:** force in Newtons.
+- **Dots on curves:** peak force markers.
+- **Legend:** sample numbers (up to 15 samples).
+
+**Zeroing threshold.** The displacement axis is zeroed at the point where force first exceeds the **zeroing threshold** in the compressive (positive) direction (default: 10 N). This eliminates the initial flat / negative-noise region where the platen hasn't contacted the specimen yet. To change the threshold, type a new value and click **Apply**.
+
+**Plot toolbar.** The matplotlib toolbar lets you pan, zoom (drag a rectangle), reset (home), and save the plot as PNG/PDF/SVG.
+
+### 7. Importing saved files (batch import)
+
+You don't need the machine connected to analyze data.
+
+1. Click **Import Files...** (top bar) or use **File → Import Files...**.
+2. Select one or more `.xml` files. Use Shift+Click or Ctrl+Click for multiples.
+3. The tool loads all valid sample files and skips summary files automatically.
+
+If a session is already active, you'll be asked whether to export it and start fresh, or add the imported files to the existing session.
+
+Useful for re-analyzing old data with different parameters, combining sessions, or working on a computer that isn't connected to the tester.
+
+### 8. Exporting data
+
+**Session summary CSV.** Click **Export Summary CSV** to save a CSV with project name, test type, date, replicate count, summary statistics (mean, std, COV, min, max), and per-replicate data.
+
+**Individual sample files.** When connected to the machine, each sample is automatically archived as both an XML file (exact copy from the machine) and a CSV file (metadata, properties, and zeroed force-displacement data), with timestamped filenames like `ECT_T839_01_20260428_143022.xml`.
+
+### 9. Troubleshooting
+
+- **"Connection failed" / status dot stays red** — check the Ethernet cable, tester power, IP address (default 192.168.0.3), and that your computer's adapter is on the same subnet (e.g., 192.168.0.x with mask 255.255.255.0).
+- **Connection drops and reconnects** — normal if the tester is busy or the network is unstable. The tool reconnects with backoff automatically.
+- **Peak force or computed values seem wrong** — check the Param column (double-click to fix), confirm the right test type is selected, and compare with the machine's own summary display.
+- **Windows SmartScreen blocks the .exe** — click **More info → Run anyway**. The `.exe` is unsigned but built from this source.
+- **Antivirus flags the .exe** — add an exception. PyInstaller executables are commonly flagged as false positives.
+- **Import skips files** — only sample files (`<SAMPLE>` root tag) are imported; summary files (`<SAMPLESET>`) are skipped automatically.
+
+### 10. Tips
+
+- Always set the output folder *before* connecting, or early-arriving data won't be archived to disk.
+- Name sessions descriptively — the name is used for the archive subfolder and export filenames.
+- Export before closing.
+- Use batch import for reporting and re-analysis.
+- The zeroing threshold affects exported CSVs too; archived CSVs use the threshold set at archive time.
+
+---
+
 ## Project Structure
 
 ```
-crush_reader.py     Main application (single file, ~1050 lines)
-build_exe.bat       Windows build script for PyInstaller
-HOW_TO_BUILD.txt    Step-by-step build instructions
-USER_GUIDE.md       Guide for lab technicians and students
-sample.xml          Example FCT test data from the machine
-summary.xml         Example summary data from the machine
+crush_reader.py             Main application (single file)
+build_exe.bat               Windows build script for PyInstaller
+requirements.txt            Runtime dependencies
+requirements-dev.txt        Test / dev dependencies
+tests/test_crush_reader.py  Unit + integration tests
+tests/fixtures/             Example XML data from the machine
 ```
 
 ---
