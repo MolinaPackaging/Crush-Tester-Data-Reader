@@ -1,0 +1,44 @@
+HOW TO BUILD THE .EXE
+=====================
+
+You need a machine with Python installed (your laptop, office PC, etc.)
+The lab computer does NOT need Python — it just runs the final .exe.
+
+STEPS:
+
+  1. Copy this entire folder to the machine that has Python.
+
+  2. Double-click "build_exe.bat" (or open a terminal in this folder
+     and run: build_exe.bat).
+
+     It will install PyInstaller + matplotlib and build the executable.
+     Takes about 1-2 minutes.
+
+  3. When it finishes, you'll find:
+        dist\CrushReader.exe
+
+  4. Copy CrushReader.exe to the lab computer (USB drive, network, etc.)
+
+  5. Double-click CrushReader.exe on the lab computer. That's it.
+
+
+NOTES:
+
+  - The .exe is fully self-contained (~40-60 MB). No Python needed.
+  - Windows may show a SmartScreen warning the first time since the .exe
+    isn't signed. Click "More info" → "Run anyway".
+  - If your antivirus flags it, add an exception for CrushReader.exe.
+    This is a known false-positive with PyInstaller executables.
+
+
+TROUBLESHOOTING:
+
+  - "Python not found": Make sure Python is on your PATH.
+    Try running: python --version
+    If that doesn't work, reinstall Python and check "Add to PATH".
+
+  - Build errors about missing modules: Make sure you have pip working.
+    Try: pip install matplotlib
+
+  - .exe crashes on lab computer: Run it from a command prompt to see
+    the error message:  cmd → cd to folder → CrushReader.exe
