@@ -131,7 +131,7 @@ The force-displacement plot shows all included samples overlaid with different c
 
 ### Zeroing threshold
 
-The displacement axis is zeroed at the point where force first exceeds the **zeroing threshold** (default: 10 N). This eliminates the initial flat region where the platen hasn't contacted the specimen yet.
+The displacement axis is zeroed at the point where force first exceeds the **zeroing threshold** in the compressive (positive) direction (default: 10 N). This eliminates the initial flat / negative-noise region where the platen hasn't contacted the specimen yet — the load cell idles around −10 N, so only positive force counts as real contact.
 
 To change the threshold, type a new value in the "Zeroing threshold" field and click **Apply**. A lower threshold keeps more of the initial curve; a higher threshold trims more.
 

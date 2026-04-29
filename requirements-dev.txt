@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# Development / build tooling. The runtime app only needs `requirements.txt`;
+# this file adds what's needed to run the test suite and produce the .exe.
+pyinstaller>=5.0

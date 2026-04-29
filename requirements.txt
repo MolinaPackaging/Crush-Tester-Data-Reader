@@ -1,0 +1,3 @@
+# Runtime dependency for the GUI app. Tkinter ships with the Python
+# standard library; matplotlib is the only external piece needed.
+matplotlib>=3.5
