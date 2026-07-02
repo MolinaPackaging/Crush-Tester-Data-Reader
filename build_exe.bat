@@ -4,11 +4,11 @@ REM ============================================================
 REM  Build ABB Crush Tester Data Reader as a standalone .exe
 REM ============================================================
 REM  Builds inside a clean, throwaway virtual environment that
-REM  contains ONLY matplotlib + pyinstaller. This keeps the build
-REM  reproducible and small on every machine, and immune to
-REM  whatever unrelated packages live in your base/Anaconda env
-REM  (Qt bindings, pandas, scipy, an obsolete pathlib backport,
-REM  etc.) that otherwise bloat or break PyInstaller.
+REM  contains ONLY matplotlib + pyinstaller, and does the actual
+REM  PyInstaller work in a LOCAL temp folder (not the OneDrive-
+REM  synced project folder). OneDrive locks files mid-write, which
+REM  makes PyInstaller's --clean fail with "Access is denied", so
+REM  we build in %TEMP% and copy just the finished .exe back.
 REM
 REM  Result: dist\CrushReader.exe  -> copy to the lab computer.
 REM ============================================================
@@ -78,14 +78,21 @@ if errorlevel 1 (
 )
 
 echo [3/4] Building executable (this takes 1-2 minutes)...
+REM  Build in a LOCAL temp folder so OneDrive can't lock the work files.
+set "BUILDTMP=%TEMP%\CrushReaderBuild"
+if exist "%BUILDTMP%" rmdir /s /q "%BUILDTMP%" 2>nul
+mkdir "%BUILDTMP%" 2>nul
 "%VPY%" -m PyInstaller ^
     --onefile ^
     --windowed ^
     --name CrushReader ^
     --noconfirm ^
     --clean ^
-    --icon=corrugated_crush_icon_assets\corrugated_crush_icon.ico ^
-    --add-data "corrugated_crush_icon_assets\corrugated_crush_icon.ico;." ^
+    --workpath "%BUILDTMP%\build" ^
+    --distpath "%BUILDTMP%\dist" ^
+    --specpath "%BUILDTMP%" ^
+    --icon="%CD%\corrugated_crush_icon_assets\corrugated_crush_icon.ico" ^
+    --add-data "%CD%\corrugated_crush_icon_assets\corrugated_crush_icon.ico;." ^
     --exclude-module PyQt5 ^
     --exclude-module PyQt6 ^
     --exclude-module PySide2 ^
@@ -95,7 +102,7 @@ echo [3/4] Building executable (this takes 1-2 minutes)...
     --exclude-module IPython ^
     --exclude-module notebook ^
     --exclude-module pytest ^
-    crush_reader.py
+    "%CD%\crush_reader.py"
 
 if errorlevel 1 (
     echo.
@@ -103,6 +110,21 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+REM Copy the finished exe out of temp into the project's dist\ folder.
+if not exist dist mkdir dist
+copy /y "%BUILDTMP%\dist\CrushReader.exe" "dist\CrushReader.exe" >nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: Built the exe but could not copy it into dist\.
+    echo   The finished file is here: %BUILDTMP%\dist\CrushReader.exe
+    echo   ^(If OneDrive is syncing, pause it and copy that file manually.^)
+    pause
+    exit /b 1
+)
+REM Best-effort cleanup of temp + any stale project build folder.
+rmdir /s /q "%BUILDTMP%" 2>nul
+if exist build rmdir /s /q build 2>nul
 
 echo [4/4] Done!
 echo.

@@ -3,9 +3,10 @@ setlocal enabledelayedexpansion
 REM ============================================================
 REM  Build the FTP Diagnostic tool as a standalone .exe
 REM ============================================================
-REM  Builds inside a clean, throwaway virtual environment that
-REM  contains ONLY pyinstaller, so the build is reproducible and
-REM  immune to whatever unrelated packages live in your base env.
+REM  Builds inside a clean, throwaway virtual environment (only
+REM  pyinstaller) and does the PyInstaller work in a LOCAL temp
+REM  folder, not the OneDrive-synced project folder (OneDrive
+REM  locks files mid-write and breaks PyInstaller's --clean).
 REM
 REM  Result: dist\FTPDiagnostic.exe -> copy to the lab computer.
 REM  No Python required on the lab machine.
@@ -76,13 +77,20 @@ if errorlevel 1 (
 )
 
 echo [3/4] Building executable (this takes about a minute)...
+REM  Build in a LOCAL temp folder so OneDrive can't lock the work files.
+set "BUILDTMP=%TEMP%\FTPDiagnosticBuild"
+if exist "%BUILDTMP%" rmdir /s /q "%BUILDTMP%" 2>nul
+mkdir "%BUILDTMP%" 2>nul
 "%VPY%" -m PyInstaller ^
     --onefile ^
     --console ^
     --name FTPDiagnostic ^
     --noconfirm ^
     --clean ^
-    ftp_diagnostic.py
+    --workpath "%BUILDTMP%\build" ^
+    --distpath "%BUILDTMP%\dist" ^
+    --specpath "%BUILDTMP%" ^
+    "%CD%\ftp_diagnostic.py"
 
 if errorlevel 1 (
     echo.
@@ -90,6 +98,21 @@ if errorlevel 1 (
     pause
     exit /b 1
 )
+
+REM Copy the finished exe out of temp into the project's dist\ folder.
+if not exist dist mkdir dist
+copy /y "%BUILDTMP%\dist\FTPDiagnostic.exe" "dist\FTPDiagnostic.exe" >nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: Built the exe but could not copy it into dist\.
+    echo   The finished file is here: %BUILDTMP%\dist\FTPDiagnostic.exe
+    echo   ^(If OneDrive is syncing, pause it and copy that file manually.^)
+    pause
+    exit /b 1
+)
+REM Best-effort cleanup of temp + any stale project build folder.
+rmdir /s /q "%BUILDTMP%" 2>nul
+if exist build rmdir /s /q build 2>nul
 
 echo [4/4] Done!
 echo.
