@@ -1,20 +1,18 @@
 @echo off
 setlocal enabledelayedexpansion
 REM ============================================================
-REM  Build ABB Crush Tester Data Reader as a standalone .exe
+REM  Build the FTP Diagnostic tool as a standalone .exe
 REM ============================================================
 REM  Builds inside a clean, throwaway virtual environment that
-REM  contains ONLY matplotlib + pyinstaller. This keeps the build
-REM  reproducible and small on every machine, and immune to
-REM  whatever unrelated packages live in your base/Anaconda env
-REM  (Qt bindings, pandas, scipy, an obsolete pathlib backport,
-REM  etc.) that otherwise bloat or break PyInstaller.
+REM  contains ONLY pyinstaller, so the build is reproducible and
+REM  immune to whatever unrelated packages live in your base env.
 REM
-REM  Result: dist\CrushReader.exe  -> copy to the lab computer.
+REM  Result: dist\FTPDiagnostic.exe -> copy to the lab computer.
+REM  No Python required on the lab machine.
 REM ============================================================
 
 echo.
-echo === ABB Crush Tester Data Reader - Build Script ===
+echo === ABB Crush Tester FTP Diagnostic - Build Script ===
 echo.
 
 REM --- Find a working Python for THIS window --------------------------
@@ -35,7 +33,7 @@ if not defined PYCMD (
     echo window. Open "Anaconda Prompt" ^(or run "conda activate base"^)
     echo and then run this script from that terminal:
     echo.
-    echo        build_exe.bat
+    echo        build_diagnostic.bat
     echo.
     echo Otherwise install Python from https://www.python.org/downloads/
     echo and tick "Add Python to PATH" during setup.
@@ -45,7 +43,7 @@ if not defined PYCMD (
 echo Using Python: !PYCMD!
 echo.
 
-REM --- Clean, isolated build environment ------------------------------
+REM --- Clean, isolated build environment (shared with build_exe) ------
 REM  We use virtualenv rather than "python -m venv": Anaconda's base Python
 REM  often ships a broken/stripped ensurepip, which makes "venv" fail while
 REM  bootstrapping pip. virtualenv carries its own pip and just works.
@@ -70,32 +68,21 @@ if not exist "%VENV%\Scripts\pip.exe" (
 
 echo [2/4] Installing dependencies into the clean environment...
 "%VPY%" -m pip install --upgrade pip --quiet
-"%VPY%" -m pip install pyinstaller matplotlib --upgrade --quiet
+"%VPY%" -m pip install pyinstaller --upgrade --quiet
 if errorlevel 1 (
     echo ERROR: Failed to install dependencies. Check your internet connection.
     pause
     exit /b 1
 )
 
-echo [3/4] Building executable (this takes 1-2 minutes)...
+echo [3/4] Building executable (this takes about a minute)...
 "%VPY%" -m PyInstaller ^
     --onefile ^
-    --windowed ^
-    --name CrushReader ^
+    --console ^
+    --name FTPDiagnostic ^
     --noconfirm ^
     --clean ^
-    --icon=corrugated_crush_icon_assets\corrugated_crush_icon.ico ^
-    --add-data "corrugated_crush_icon_assets\corrugated_crush_icon.ico;." ^
-    --exclude-module PyQt5 ^
-    --exclude-module PyQt6 ^
-    --exclude-module PySide2 ^
-    --exclude-module PySide6 ^
-    --exclude-module pandas ^
-    --exclude-module scipy ^
-    --exclude-module IPython ^
-    --exclude-module notebook ^
-    --exclude-module pytest ^
-    crush_reader.py
+    ftp_diagnostic.py
 
 if errorlevel 1 (
     echo.
@@ -108,10 +95,17 @@ echo [4/4] Done!
 echo.
 echo ============================================================
 echo   Your executable is ready:
-echo   %CD%\dist\CrushReader.exe
+echo   %CD%\dist\FTPDiagnostic.exe
 echo.
-echo   Copy this single file to the lab computer and run it.
-echo   No Python or other software needed on the lab machine.
+echo   Copy this single file to the lab computer and run it
+echo   from a Command Prompt:
+echo.
+echo     FTPDiagnostic.exe                  (interactive menu)
+echo     FTPDiagnostic.exe --quick          (one probe per strategy)
+echo     FTPDiagnostic.exe --run-all        (full matrix)
+echo.
+echo   Logs:     ftp_diagnostic_logs\       (TSV per run)
+echo   Payloads: ftp_diagnostic_payloads\   (one file per probe)
 echo ============================================================
 echo.
 

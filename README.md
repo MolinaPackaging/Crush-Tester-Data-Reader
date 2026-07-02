@@ -46,10 +46,12 @@ python crush_reader.py
 You need a Windows machine with Python 3.8+ installed. The lab computer does **not** need Python — it just runs the final `.exe`.
 
 1. Clone or copy this folder to the machine that has Python.
-2. Double-click `build_exe.bat` (or run it from a terminal).
-3. Wait ~1–2 minutes. The script installs PyInstaller and matplotlib, then builds the executable.
+2. Run `build_exe.bat`. If you use **Anaconda/Miniconda**, run it from an *Anaconda Prompt* (or a `conda activate`d terminal) rather than double-clicking — a double-clicked script opens a fresh window where conda isn't active.
+3. Wait ~1–2 minutes. On the first run the script creates a clean, isolated build environment (`.build_venv`) containing only matplotlib + PyInstaller, then builds. Later runs reuse it and are faster.
 4. Find the result in `dist\CrushReader.exe` (~40–60 MB).
 5. Copy `CrushReader.exe` to the lab computer via USB drive or network.
+
+> **Why the isolated environment?** Building directly from a shared base env (especially Anaconda) pulls in unrelated packages that bloat or break PyInstaller — conflicting Qt bindings (`PyQt5` + `PySide6`), an obsolete `pathlib` backport, pandas/scipy, and so on. The `.build_venv` sidesteps all of that so the build is small and identical on every machine. It's safe to delete `.build_venv` anytime; it will be recreated on the next build.
 
 ### Notes
 
@@ -59,8 +61,8 @@ You need a Windows machine with Python 3.8+ installed. The lab computer does **n
 
 ### Troubleshooting
 
-- **"Python not found"** — make sure Python is on your `PATH`. Run `python --version` to verify. If it doesn't work, reinstall Python and check **Add to PATH**.
-- **Build errors about missing modules** — make sure `pip` works. Try `pip install matplotlib`.
+- **"Python not found"** — if you use Anaconda/Miniconda, run the script from an *Anaconda Prompt* (or after `conda activate base`); a double-clicked `.bat` runs in a window where conda isn't active. Otherwise install Python from python.org and tick **Add Python to PATH**. The script auto-detects `python`, `py -3`, and `python3`.
+- **Build errors about Qt bindings, `pathlib`, or unrelated packages** — these come from a contaminated base environment. The build now uses a clean `.build_venv` to avoid them; if you ever hit one, delete `.build_venv` and re-run to rebuild the environment from scratch.
 - **`.exe` crashes on the lab computer** — run it from a command prompt (`cmd` → `cd` to the folder → `CrushReader.exe`) to see the error message.
 
 ---
@@ -88,7 +90,17 @@ The crush tester writes two files to its FTP server after each test:
 - **`sample.xml`** — raw force-displacement data for the last test. This file is **overwritten** on every new test.
 - **`summary.xml`** — accumulated session statistics from the machine.
 
-The tool polls the FTP server every few seconds. When `sample.xml` changes, it downloads the new data, parses it, archives a timestamped copy, and adds the replicate to the current session.
+The tool polls the FTP server every few seconds, always downloading `sample.xml` (the files are tiny) and comparing a content hash to the previous poll to detect changes.
+
+### Reliable Capture (v3.4)
+
+Because the machine reuses one `sample.xml` for every test, the tool identifies a **completed replicate** by its content — the `SAMPLEID` + `SAMPLENO` the machine writes — rather than by raw file bytes. This makes capture robust in three ways:
+
+- **No missed tests from stale metadata.** Earlier versions skipped the download when the server reported an unchanged `SIZE`/`MDTM`. Embedded FTP servers often report coarse or non-updating timestamps, so a genuinely new test could look unchanged and be dropped. The tool now always downloads and trusts the content hash.
+- **No mid-write duplicates.** A `sample.xml` caught while the machine is still writing it (no computed `RESULTS` block yet) is treated as incomplete and skipped until the finished file arrives.
+- **No double-counting.** Each `SAMPLENO` is recorded once. Re-reading or re-importing the same file is de-duplicated; a more-complete read of the same replicate replaces the earlier one in place.
+
+If the machine's `SAMPLENO` jumps (e.g., a replicate was overwritten before a poll could grab it), the log warns which numbers were missed. The tool also cross-checks each `summary.xml` against what it captured and flags any replicate the machine recorded but it never saw.
 
 ### Thousand-Separator Handling
 
@@ -215,7 +227,13 @@ Useful for re-analyzing old data with different parameters, combining sessions, 
 
 ### 8. Exporting data
 
-**Session summary CSV.** Click **Export Summary CSV** to save a CSV with project name, test type, date, replicate count, summary statistics (mean, std, COV, min, max), and per-replicate data.
+**Session export (one click).** Click **Export Summary** to write a complete bundle into the session folder at once:
+
+- `*_summary_*.csv` — project name, test type, date, replicate count, summary statistics (mean, std, COV, min, max), and the per-replicate table.
+- `*_alldata_*.csv` — every replicate's zeroed force-displacement curve, laid out as a Displacement/Force column pair per sample side by side (excluded replicates are included too, tagged, so no raw data is lost). Easy to re-plot in Excel.
+- `*_graph_*.svg` and `*_graph_*.png` — the overlaid force-displacement plot. The SVG is high-quality vector (scales to any size for reports); the PNG is 300 DPI for quick pasting.
+
+The graph reflects the included samples and the current zeroing threshold. The summary CSV is always written first, so a plotting hiccup can never cost you the statistics.
 
 **Individual sample files.** When connected to the machine, each sample is automatically archived as both an XML file (exact copy from the machine) and a CSV file (metadata, properties, and zeroed force-displacement data), with timestamped filenames like `ECT_T839_01_20260428_143022.xml`.
 

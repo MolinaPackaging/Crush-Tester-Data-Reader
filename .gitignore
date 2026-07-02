@@ -19,6 +19,7 @@ htmlcov/
 venv/
 .venv/
 env/
+.build_venv/
 
 # IDE / Editor
 .vscode/
@@ -38,3 +39,13 @@ Desktop.ini
 
 # Vendor docs / large binaries
 *.pdf
+
+# Local agent / editor state
+.claude/
+
+# Example / test datasets (large, not needed in the repo)
+Example_data/
+
+# FTP diagnostic run outputs
+ftp_diagnostic_logs/
+ftp_diagnostic_payloads/

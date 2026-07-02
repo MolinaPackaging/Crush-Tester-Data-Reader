@@ -40,7 +40,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
-__version__ = "3.2.0"
+__version__ = "3.5.0"
 
 # ---------------------------------------------------------------------------
 #  CONSTANTS
@@ -166,10 +166,17 @@ def parse_summary_xml_bytes(xml_bytes: bytes) -> dict:
     root = ET.fromstring(xml_bytes)
     data: dict = {
         "code_id": root.findtext("CODEID", ""),
+        "sample_id": root.findtext("SAMPLEID", ""),
         "program_name": root.findtext("PROGRAMNAME", ""),
         "end_serie": root.findtext("ENDSERIE", "0"),
         "items": [],
+        # The union of SAMPLENOS across all properties — the machine's
+        # authoritative list of which replicates it has recorded. Lets us
+        # detect a sample.xml we never captured (overwritten before a poll).
+        "sample_nos": [],
+        "total_samples": 0,
     }
+    seen_nos: set[int] = set()
     for item in root.findall(".//SUMMARY/ITEM"):
         data["items"].append({
             "property_name": item.findtext("PROPERTYNAME", ""),
@@ -179,7 +186,62 @@ def parse_summary_xml_bytes(xml_bytes: bytes) -> dict:
             "std": item.findtext("STD", ""),
             "n_values": item.findtext("NOVALUES", ""),
         })
+        for tok in (item.findtext("SAMPLENOS", "") or "").split(","):
+            tok = tok.strip()
+            if tok.isdigit():
+                seen_nos.add(int(tok))
+    data["sample_nos"] = sorted(seen_nos)
+    data["total_samples"] = len(seen_nos)
     return data
+
+
+# ---------------------------------------------------------------------------
+#  COMPLETED-TEST IDENTITY & COMPLETENESS
+# ---------------------------------------------------------------------------
+#
+# Reliability model: the machine overwrites a single sample.xml on every test,
+# so we cannot rely on file bytes to tell one completed test from the next. A
+# poll can also catch the file mid-write. We therefore identify a *completed*
+# replicate by its content — (SAMPLEID, SAMPLENO) — and only ingest it once the
+# machine has finished writing it (its computed RESULTS block is present).
+
+def sample_identity(parsed: dict) -> tuple[str, int]:
+    """Series-relative identity of a replicate: (SAMPLEID, SAMPLENO).
+
+    SAMPLENO is the machine's per-series replicate counter (1, 2, 3, …); it
+    restarts at 1 for each new series. Returns SAMPLENO as 0 if unparseable.
+    """
+    sid = parsed.get("sample_id", "") or ""
+    raw = str(parsed.get("sample_no", "0")).strip()
+    try:
+        sno = int(raw or "0")
+    except ValueError:
+        sno = 0
+    return sid, sno
+
+
+def sample_completeness(parsed: dict) -> tuple[int, int]:
+    """A comparable "how finished is this file" score (higher = more complete).
+
+    (number of computed RESULTS items, number of raw data points). The machine
+    writes RESULTS only after a test finishes, so the first component crossing
+    zero is the "test done" signal; the second breaks ties between two reads of
+    the same replicate (a later, longer curve wins).
+    """
+    n_results = len(parsed.get("results") or [])
+    n_points = min(len(parsed.get("x_values") or []),
+                   len(parsed.get("y_values") or []))
+    return n_results, n_points
+
+
+def is_complete_sample(parsed: dict) -> bool:
+    """True once a sample.xml represents a finished test: it carries the
+    machine's computed RESULTS block *and* a non-empty force-displacement
+    curve. Partial reads captured mid-test are rejected until the next poll
+    sees the finished file.
+    """
+    n_results, n_points = sample_completeness(parsed)
+    return n_results > 0 and n_points > 0
 
 
 # ---------------------------------------------------------------------------
@@ -259,6 +321,12 @@ class TestSession:
         self.sample_params: list[float] = []
         self.last_summary: Optional[dict] = None
         self.created_at = datetime.now()
+        # De-duplication state, keyed by (SAMPLEID, SAMPLENO) within the
+        # current machine series. Used by ingest_sample(); add_sample() stays a
+        # dumb append so existing callers/tests keep their semantics.
+        self._seen: dict[tuple[str, int], int] = {}
+        self._series_id: Optional[str] = None
+        self._max_no: int = 0
 
     @property
     def count(self) -> int:
@@ -272,6 +340,76 @@ class TestSession:
         self.xml_bytes_list.append(xml_bytes)
         self.included.append(True)
         self.sample_params.append(p)
+
+    def ingest_sample(self, parsed: dict, xml_bytes: bytes,
+                      param: Optional[float] = None) -> dict:
+        """De-duplicating add for live/imported data. Identifies a completed
+        replicate by (SAMPLEID, SAMPLENO) so the same physical test can never
+        land twice, a mid-write partial never displaces a finished read, and a
+        skipped SAMPLENO is surfaced instead of silently lost.
+
+        Returns a status dict:
+          status : "added" | "updated" | "duplicate" | "incomplete"
+          index  : position in self.samples (None if incomplete)
+          sample_no : the parsed SAMPLENO
+          gap : list of SAMPLENOs the machine skipped past (missed replicates)
+          series_changed : True if this sample starts a new machine series
+        """
+        result = {"status": "incomplete", "index": None,
+                  "sample_no": None, "gap": [], "series_changed": False}
+        if not is_complete_sample(parsed):
+            return result
+
+        sid, sno = sample_identity(parsed)
+        result["sample_no"] = sno
+
+        # New series on a SAMPLEID change: reset the dedup map so the new
+        # specimen's replicates are accepted. We deliberately do NOT treat a
+        # repeat of SAMPLENO 1 under the *same* SAMPLEID as a new series —
+        # that would defeat de-duplication of re-imported / re-read files,
+        # which is the common case. To collect a genuinely new run of the same
+        # specimen ID, start a New Session.
+        if self._series_id is not None and sid != self._series_id:
+            result["series_changed"] = True
+            self._seen = {}
+            self._max_no = 0
+        self._series_id = sid
+
+        key = (sid, sno)
+        if key in self._seen:
+            idx = self._seen[key]
+            # A later read of the same replicate only wins if it is strictly
+            # more complete than what we stored (a mid-write partial finalized,
+            # or a longer curve). An identical or shorter re-read is a no-op.
+            if sample_completeness(parsed) > sample_completeness(self.samples[idx]):
+                self._replace_sample(idx, parsed, xml_bytes, param)
+                result["status"] = "updated"
+            else:
+                result["status"] = "duplicate"
+            result["index"] = idx
+            return result
+
+        # Genuinely new replicate. Flag any skipped numbers before adding.
+        if self._max_no >= 1 and sno > self._max_no + 1:
+            result["gap"] = list(range(self._max_no + 1, sno))
+        self.add_sample(parsed, xml_bytes, param)
+        idx = len(self.samples) - 1
+        self._seen[key] = idx
+        self._max_no = max(self._max_no, sno)
+        result["status"] = "added"
+        result["index"] = idx
+        return result
+
+    def _replace_sample(self, idx: int, parsed: dict, xml_bytes: bytes,
+                        param: Optional[float] = None) -> None:
+        """Swap in a more-complete version of an already-stored replicate,
+        preserving the user's per-sample param and include/exclude choice.
+        """
+        p = self.sample_params[idx] if param is None else param
+        parsed["computed"] = compute_value(parsed, self.test_type, p)
+        self.samples[idx] = parsed
+        self.xml_bytes_list[idx] = xml_bytes
+        self.sample_params[idx] = p
 
     def update_param(self, idx: int, new_param: float) -> None:
         """Override the param for a single sample and recompute it."""
@@ -423,6 +561,120 @@ def export_session_summary(
     return path
 
 
+def export_all_curves(
+    session: "TestSession",
+    output_dir: str | Path,
+    session_folder: str = "",
+    threshold: float = DEFAULT_THRESHOLD_N,
+) -> Path:
+    """Write every replicate's zeroed force-displacement curve into one wide
+    CSV: a Displacement/Force column pair per sample, side by side. Includes
+    excluded replicates too (tagged) so no raw data is lost. Returns the path.
+    """
+    save_dir = Path(output_dir) / session_folder if session_folder else Path(output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = sanitize_filename(session.project_name) or "session"
+    path = save_dir / f"{name}_alldata_{ts}.csv"
+
+    curves = []
+    for i, s in enumerate(session.samples):
+        xz, yz = apply_threshold_zeroing(s["x_values"], s["y_values"], threshold)
+        curves.append((i, s, xz, yz))
+    max_len = max((len(xz) for _, _, xz, _ in curves), default=0)
+
+    with path.open("w", newline="", encoding=CSV_ENCODING) as f:
+        w = csv.writer(f)
+        group, cols = [], []
+        for i, s, _, _ in curves:
+            tag = "included" if session.included[i] else "excluded"
+            group += [f"#{i + 1} {s['sample_id']} [{tag}]", ""]
+            cols += ["Displacement (mm)", "Force (N)"]
+        w.writerow(group)
+        w.writerow(cols)
+        for r in range(max_len):
+            row = []
+            for _, _, xz, yz in curves:
+                if r < len(xz):
+                    row += [f"{xz[r]:.4f}", f"{yz[r]:.2f}"]
+                else:
+                    row += ["", ""]
+            w.writerow(row)
+    return path
+
+
+def render_session_curves(ax, session: "TestSession", threshold: float,
+                          highlight_idx: Optional[int] = None) -> int:
+    """Draw a session's *included* force-displacement curves (with peak
+    markers, grid, title and legend) onto a matplotlib Axes. Shared by the
+    live plot and the exported figure so they can never drift apart. Returns
+    the number of curves drawn. ``highlight_idx`` dims the other curves; pass
+    None (the export default) to show them all at full opacity.
+    """
+    plotted = 0
+    for i, sample in enumerate(session.samples):
+        if not session.included[i]:
+            continue
+        xz, yz = apply_threshold_zeroing(sample["x_values"], sample["y_values"], threshold)
+        if not xz:
+            continue
+        color = COLORS[i % len(COLORS)]
+        is_sel = (highlight_idx == i)
+        alpha = 1.0 if (highlight_idx is None or is_sel) else 0.25
+        lw = 2.0 if is_sel else 1.0
+        ax.plot(xz, yz, lw=lw, color=color, alpha=alpha, label=f"#{i + 1}")
+        peak_y = max(yz)
+        peak_x = xz[yz.index(peak_y)]
+        marker_size = 8 if is_sel else 5
+        ax.plot(peak_x, peak_y, 'o', color=color, markersize=marker_size,
+                alpha=alpha, zorder=5)
+        plotted += 1
+    ax.set_xlabel("Displacement (mm)")
+    ax.set_ylabel("Force (N)")
+    title = session.project_name or session.test_type
+    ax.set_title(f"{title}  ({plotted} curve{'s' if plotted != 1 else ''})")
+    ax.grid(True, alpha=0.3)
+    if 0 < plotted <= 15:
+        ax.legend(fontsize=7, ncol=min(plotted, 5), loc="upper left", framealpha=0.7)
+    return plotted
+
+
+def export_session_graph(
+    session: "TestSession",
+    output_dir: str | Path,
+    session_folder: str = "",
+    threshold: float = DEFAULT_THRESHOLD_N,
+    formats: tuple[str, ...] = ("svg", "png"),
+) -> list[Path]:
+    """Render the session's overlaid curves to a standalone figure and save it
+    in each requested format. SVG is high-quality vector; PNG is 300 DPI.
+    Independent of the live Tk canvas. Returns the list of written paths.
+    """
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+    save_dir = Path(output_dir) / session_folder if session_folder else Path(output_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    name = sanitize_filename(session.project_name) or "session"
+
+    fig = Figure(figsize=(9, 5.5), dpi=100)
+    FigureCanvasAgg(fig)
+    ax = fig.add_subplot(111)
+    render_session_curves(ax, session, threshold, highlight_idx=None)
+    fig.tight_layout()
+
+    written: list[Path] = []
+    for fmt in formats:
+        p = save_dir / f"{name}_graph_{ts}.{fmt}"
+        if fmt == "png":
+            fig.savefig(p, format="png", dpi=300, bbox_inches="tight")
+        else:
+            fig.savefig(p, format=fmt, bbox_inches="tight")
+        written.append(p)
+    return written
+
+
 # ---------------------------------------------------------------------------
 #  FTP MONITOR
 # ---------------------------------------------------------------------------
@@ -461,7 +713,12 @@ class FTPMonitor:
         self._ftp: Optional[ftplib.FTP] = None
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
+        # Track file content to detect changes (hash of last download)
         self._file_hashes: dict[str, str] = {}
+        # Track server-reported metadata so we can skip RETR when nothing
+        # changed AND so the SIZE/MDTM probes act as refresh signals
+        # (embedded FTP servers re-read the disk in response to these).
+        self._file_meta: dict[str, tuple[Optional[int], Optional[str]]] = {}
         self._hashes_lock = threading.Lock()
         self.on_status_change: Optional[StatusCallback] = None
         self.on_sample_changed: Optional[BytesCallback] = None
@@ -491,78 +748,157 @@ class FTPMonitor:
                 pass
         self._ftp = None
 
-    def _connect(self) -> bool:
-        self._close_ftp()
-        try:
-            self._ftp = ftplib.FTP()
-            self._ftp.connect(self.host, self.port, timeout=FTP_TIMEOUT_SECONDS)
-            self._ftp.login(self.user, self.password)
-            self._ftp.cwd(self.remote_dir)
-        except (ftplib.all_errors, OSError) as e:
-            self._ftp = None
-            self._set_status(f"Connection failed: {e}", False)
-            self._log(f"Connection failed: {e}")
-            return False
-        self._set_status(f"Connected to {self.host}", True)
-        self._log(f"Connected to {self.host}:{self.port}")
-        return True
-
-    def _download(self, fn: str) -> Optional[bytes]:
+    def _download(self, ftp: ftplib.FTP, fn: str) -> Optional[bytes]:
         try:
             buf = bytearray()
-            self._ftp.retrbinary(f"RETR {fn}", buf.extend)
+            ftp.retrbinary(f"RETR {fn}", buf.extend)
             return bytes(buf)
-        except (ftplib.all_errors, OSError) as e:
+        except (*ftplib.all_errors, OSError) as e:
             self._log(f"Download error ({fn}): {e}")
             return None
 
-    def _check(self, fn: str) -> Optional[bytes]:
-        data = self._download(fn)
+    def _fresh_connect(self) -> Optional[ftplib.FTP]:
+        """Open a brand-new FTP connection. Returns the FTP object or None.
+
+        Embedded FTP servers (like the ABB crush tester) can return stale
+        / cached file data over long-lived connections.  Opening a fresh
+        connection for every poll guarantees we always read what is
+        currently on disk.
+        """
+        try:
+            ftp = ftplib.FTP()
+            ftp.connect(self.host, self.port, timeout=FTP_TIMEOUT_SECONDS)
+            ftp.login(self.user, self.password)
+            ftp.cwd(self.remote_dir)
+            return ftp
+        except (*ftplib.all_errors, OSError) as e:
+            self._log(f"Connection failed: {e}")
+            return None
+
+    @staticmethod
+    def _refresh_listing(ftp: ftplib.FTP) -> None:
+        """Issue a LIST on the current directory to force the embedded FTP
+        server to re-scan its disk. This mirrors what FileZilla's "Refresh
+        file and directory" button does, and is the difference between
+        seeing new test results and being stuck on a cached snapshot.
+        """
+        try:
+            ftp.retrlines("LIST", lambda _: None)
+        except (*ftplib.all_errors, OSError):
+            # Non-fatal: if LIST fails we still try the RETR path.
+            pass
+
+    @staticmethod
+    def _probe_meta(ftp: ftplib.FTP, fn: str
+                    ) -> tuple[Optional[int], Optional[str]]:
+        """Return (SIZE, MDTM) for *fn*, or (None, None) on failure. The
+        commands themselves act as refresh hints to the embedded server.
+        """
+        size: Optional[int] = None
+        mdtm: Optional[str] = None
+        try:
+            size = ftp.size(fn)
+        except (*ftplib.all_errors, OSError):
+            pass
+        try:
+            resp = ftp.voidcmd(f"MDTM {fn}")
+            parts = resp.split()
+            mdtm = parts[-1] if parts else None
+        except (*ftplib.all_errors, OSError):
+            pass
+        return size, mdtm
+
+    @staticmethod
+    def _close(ftp: Optional[ftplib.FTP]) -> None:
+        if ftp is None:
+            return
+        try:
+            ftp.quit()
+        except Exception:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _check(self, ftp: ftplib.FTP, fn: str) -> Optional[bytes]:
+        """Download *fn* and compare its content hash to the previous poll.
+
+        Returns the file bytes only when content has actually changed
+        (or on first poll if ``load_existing`` is set).
+
+        We probe SIZE / MDTM purely as a *refresh hint* — those commands make
+        most embedded FTP servers re-read the disk before the RETR — but we no
+        longer trust them to decide whether to skip the download. An embedded
+        server with coarse or non-updating MDTM would make a genuinely new test
+        look unchanged and get dropped. The files are tiny (~30 KB), so we
+        always RETR and let the content hash be the sole source of truth.
+        """
+        size, mdtm = self._probe_meta(ftp, fn)  # refresh hint only
+        with self._hashes_lock:
+            prev_hash = self._file_hashes.get(fn)
+
+        data = self._download(ftp, fn)
         if data is None:
             return None
         h = hashlib.md5(data).hexdigest()
         with self._hashes_lock:
-            prev = self._file_hashes.get(fn)
             self._file_hashes[fn] = h
-        if prev is None:
-            # First time seeing this file after connect
+            self._file_meta[fn] = (size, mdtm)
+        if prev_hash is None:
+            # First time seeing this file
             if self.load_existing:
                 self._log(f"Initial load: {fn} ({len(data)} bytes)")
                 return data
             else:
-                self._log(f"Baseline recorded: {fn} ({len(data)} bytes, skipped)")
+                self._log(f"Baseline: {fn} ({len(data)} bytes, hash={h[:8]}…)")
                 return None
-        if h != prev:
-            self._log(f"Changed: {fn} ({len(data)} bytes)")
+        if h != prev_hash:
+            self._log(f"Changed: {fn} ({len(data)} bytes, size={size}, "
+                      f"hash {prev_hash[:8]}… → {h[:8]}…)")
             return data
-        return None
+        return None  # No change
 
     def _loop(self) -> None:
         backoff = 1
+        connected_once = False
         while not self._stop_event.is_set():
-            if self._ftp is None:
-                if not self._connect():
-                    if self._stop_event.wait(min(backoff, RECONNECT_BACKOFF_MAX)):
-                        break
-                    backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
-                    continue
-                backoff = 1
+            # Open a FRESH connection for every poll cycle so the
+            # embedded FTP server cannot serve stale cached data.
+            ftp = self._fresh_connect()
+            if ftp is None:
+                if not connected_once:
+                    self._set_status(f"Cannot reach {self.host}", False)
+                else:
+                    self._set_status("Disconnected — retrying…", False)
+                if self._stop_event.wait(min(backoff, RECONNECT_BACKOFF_MAX)):
+                    break
+                backoff = min(backoff * 2, RECONNECT_BACKOFF_MAX)
+                continue
+
+            if not connected_once:
+                self._set_status(f"Connected to {self.host}", True)
+                self._log(f"Connected to {self.host}:{self.port}")
+                connected_once = True
+            backoff = 1
+
             try:
-                data = self._check("sample.xml")
+                # FileZilla-style refresh: forces the embedded FTP server
+                # to re-scan its disk before we ask for any file.
+                self._refresh_listing(ftp)
+                data = self._check(ftp, "sample.xml")
                 if data and self.on_sample_changed:
                     self.on_sample_changed(data)
-                data = self._check("summary.xml")
+                data = self._check(ftp, "summary.xml")
                 if data and self.on_summary_changed:
                     self.on_summary_changed(data)
-                self._ftp.voidcmd("NOOP")
-            except (ftplib.all_errors, OSError) as e:
-                self._log(f"Connection lost: {e}")
-                self._set_status("Disconnected — reconnecting...", False)
-                self._close_ftp()
-                backoff = 1
-                continue
+            except (*ftplib.all_errors, OSError) as e:
+                self._log(f"Poll error: {e}")
+            finally:
+                self._close(ftp)
+
             self._stop_event.wait(self.poll_interval)
-        self._close_ftp()
+
+        self._close_ftp()  # clean up the legacy self._ftp if set
 
     def start(self) -> None:
         if self.is_running():
@@ -570,6 +906,7 @@ class FTPMonitor:
         self._stop_event.clear()
         with self._hashes_lock:
             self._file_hashes.clear()
+            self._file_meta.clear()
         self._thread = threading.Thread(
             target=self._loop, name="FTPMonitor", daemon=True)
         self._thread.start()
@@ -585,6 +922,7 @@ class FTPMonitor:
     def force_refresh(self) -> None:
         with self._hashes_lock:
             self._file_hashes.clear()
+            self._file_meta.clear()
         self._log("Forced refresh — will re-download on next poll")
 
 
@@ -1051,6 +1389,14 @@ class CrushReaderApp:
         except (ET.ParseError, ValueError) as e:
             self._log(f"Parse error on sample.xml: {e}")
             return
+        # Completeness gate: skip a sample.xml caught mid-write (well-formed but
+        # not yet finished — no computed RESULTS). Don't archive or ingest it;
+        # the next poll will see the finished file and its changed hash.
+        if not is_complete_sample(parsed):
+            _sid, _sno = sample_identity(parsed)
+            self._log(f"Partial sample.xml (SAMPLENO={_sno}, no RESULTS yet) "
+                      "— waiting for the machine to finish")
+            return
         # Disk IO is fine on the worker; UI mutation is not.
         try:
             session_folder = sanitize_filename(self._derive_session_name(parsed))
@@ -1086,21 +1432,55 @@ class CrushReaderApp:
             self.export_btn.config(state=tk.NORMAL)
         elif not self.session.project_name and parsed.get("program_name"):
             self.session.project_name = self._derive_session_name(parsed)
-        self.session.add_sample(parsed, xml_bytes)
-        if xml_path is not None:
-            self._log(f"[#{self.session.count}] {xml_path.name}")
-        else:
-            self._log(f"[#{self.session.count}] (archive failed)")
-        self._update_session_label()
-        self._refresh_table()
-        self._update_summary()
-        self._update_plot()
+
+        res = self.session.ingest_sample(parsed, xml_bytes)
+        if res["series_changed"]:
+            self._log("⚠ New machine series detected (SAMPLENO restarted) — "
+                      "consider starting a New Session to keep stats separate.")
+        if res["gap"]:
+            missed = ", ".join(str(n) for n in res["gap"])
+            self._log(f"⚠ Missed replicate(s) {missed}: the machine advanced "
+                      "past them before this tool captured them. Their raw "
+                      "curves are gone; re-run or slow the machine's cadence.")
+
+        status, sno = res["status"], res["sample_no"]
+        if status in ("added", "updated"):
+            tag = "updated" if status == "updated" else f"#{self.session.count}"
+            name = xml_path.name if xml_path is not None else "(archive failed)"
+            self._log(f"[{tag}] SAMPLENO={sno}  {name}")
+            self._update_session_label()
+            self._refresh_table()
+            self._update_summary()
+            self._update_plot()
+        elif status == "duplicate":
+            self._log(f"Duplicate SAMPLENO={sno} ignored (already captured)")
 
     def _ingest_machine_summary(self, parsed: dict) -> None:
         if self.session:
             self.session.last_summary = parsed
+            self._reconcile_summary(parsed)
         self._log(f"Machine summary: {parsed['program_name']}")
         self._show_machine_summary(parsed)
+
+    def _reconcile_summary(self, parsed: dict) -> None:
+        """Cross-check the machine's authoritative SAMPLENOS against what this
+        tool has actually captured. Catches replicates that were overwritten
+        before a poll could grab them — a miss the tool would otherwise never
+        know about.
+        """
+        machine_nos = set(parsed.get("sample_nos") or [])
+        if not machine_nos or not self.session:
+            return
+        # Only compare within the same series the summary describes.
+        sid = parsed.get("sample_id", "")
+        have = {sample_identity(s)[1] for s in self.session.samples
+                if not sid or sample_identity(s)[0] == sid}
+        missing = sorted(machine_nos - have)
+        if missing:
+            miss = ", ".join(str(n) for n in missing)
+            self._log(f"⚠ Machine recorded {len(machine_nos)} replicate(s); "
+                      f"this tool is missing raw data for SAMPLENO {miss}. "
+                      "Those files were overwritten before capture.")
 
     # ========== BATCH IMPORT ==========
 
@@ -1136,8 +1516,11 @@ class CrushReaderApp:
                 self._log(f"  Skipped (not sample): {path.name}")
                 continue
             try:
-                self._load_sample_bytes(raw, path.name)
-                loaded += 1
+                status = self._load_sample_bytes(raw, path.name)
+                if status in ("added", "updated"):
+                    loaded += 1
+                else:  # duplicate / incomplete
+                    skipped += 1
             except (ET.ParseError, ValueError) as e:
                 errors.append(f"{path.name}: {e}")
 
@@ -1154,9 +1537,10 @@ class CrushReaderApp:
         if errors:
             self._log("Import errors:\n  " + "\n  ".join(errors))
 
-    def _load_sample_bytes(self, xml_bytes: bytes, filename: str = "") -> None:
+    def _load_sample_bytes(self, xml_bytes: bytes, filename: str = "") -> str:
         """Parse a sample XML and add it to the (possibly new) session.
-        Runs on the UI thread — used by batch import.
+        Runs on the UI thread — used by batch import. Returns the ingest
+        status ("added" / "updated" / "duplicate" / "incomplete").
         """
         parsed = parse_sample_xml_bytes(xml_bytes)
         if not self.session:
@@ -1166,12 +1550,19 @@ class CrushReaderApp:
             self.export_btn.config(state=tk.NORMAL)
         elif not self.session.project_name:
             self.session.project_name = self._derive_session_name(parsed)
-        self.session.add_sample(parsed, xml_bytes)
-        self._update_session_label()
-        self._refresh_table()
-        self._update_summary()
-        self._update_plot()
-        self._log(f"  Loaded: {filename} (#{self.session.count})")
+        res = self.session.ingest_sample(parsed, xml_bytes)
+        status, sno = res["status"], res["sample_no"]
+        if status in ("added", "updated"):
+            self._update_session_label()
+            self._refresh_table()
+            self._update_summary()
+            self._update_plot()
+            self._log(f"  Loaded: {filename} (SAMPLENO={sno}, #{self.session.count})")
+        elif status == "duplicate":
+            self._log(f"  Skipped duplicate: {filename} (SAMPLENO={sno})")
+        else:  # incomplete
+            self._log(f"  Skipped incomplete: {filename}")
+        return status
 
     # ========== TABLE UPDATES ==========
 
@@ -1234,38 +1625,9 @@ class CrushReaderApp:
             self.ax.grid(True, alpha=0.3); self.fig.tight_layout()
             self.canvas.draw(); return
 
-        s = self.session
-        th = self._get_threshold()
         sel = self.rep_tree.selection()
         sel_idx = int(sel[0]) if sel else None
-        plotted = 0
-
-        for i, sample in enumerate(s.samples):
-            if not s.included[i]: continue
-            xz, yz = apply_threshold_zeroing(sample["x_values"], sample["y_values"], th)
-            if not xz: continue
-            color = COLORS[i % len(COLORS)]
-            is_sel = (sel_idx == i)
-            alpha = 1.0 if (sel_idx is None or is_sel) else 0.25
-            lw = 2.0 if is_sel else 1.0
-            self.ax.plot(xz, yz, lw=lw, color=color, alpha=alpha, label=f"#{i+1}")
-
-            # Peak marker
-            peak_y = max(yz)
-            peak_idx = yz.index(peak_y)
-            peak_x = xz[peak_idx]
-            marker_size = 8 if is_sel else 5
-            self.ax.plot(peak_x, peak_y, 'o', color=color, markersize=marker_size,
-                         alpha=alpha, zorder=5)
-
-            plotted += 1
-
-        self.ax.set_xlabel("Displacement (mm)"); self.ax.set_ylabel("Force (N)")
-        title = s.project_name or s.test_type
-        self.ax.set_title(f"{title}  ({plotted} curve{'s' if plotted!=1 else ''})")
-        self.ax.grid(True, alpha=0.3)
-        if 0 < plotted <= 15:
-            self.ax.legend(fontsize=7, ncol=min(plotted, 5), loc="upper left", framealpha=0.7)
+        render_session_curves(self.ax, self.session, self._get_threshold(), sel_idx)
         self.fig.tight_layout()
         self.canvas.draw()
 
@@ -1280,9 +1642,21 @@ class CrushReaderApp:
             if not self.output_dir:
                 return
         sf = sanitize_filename(self.session.project_name or "session")
-        path = export_session_summary(self.session, self.output_dir, sf)
-        self._log(f"Exported: {path.name}")
-        messagebox.showinfo("Exported", f"Saved to:\n{path}")
+        th = self._get_threshold()
+        # Summary CSV is the essential deliverable — write it first so a plot
+        # or data hiccup can never cost you the stats.
+        paths = [export_session_summary(self.session, self.output_dir, sf)]
+        try:
+            paths.append(export_all_curves(self.session, self.output_dir, sf, th))
+            paths += export_session_graph(
+                self.session, self.output_dir, sf, th, ("svg", "png"))
+        except Exception as e:
+            self._log(f"Export warning (data/graph): {e}")
+        for p in paths:
+            self._log(f"Exported: {p.name}")
+        folder = Path(paths[0]).parent
+        listing = "\n".join(f"  •  {p.name}" for p in paths)
+        messagebox.showinfo("Exported", f"Saved to:\n{folder}\n\n{listing}")
 
     # ========== RUN ==========
 
