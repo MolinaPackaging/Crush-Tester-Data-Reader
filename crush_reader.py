@@ -22,6 +22,7 @@ from __future__ import annotations
 import csv
 import ftplib
 import hashlib
+import json
 import math
 import os
 import re
@@ -30,7 +31,7 @@ import threading
 import tkinter as tk
 from datetime import datetime
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
+from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 from typing import Callable, Optional
 from xml.etree import ElementTree as ET
 
@@ -40,7 +41,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.figure import Figure
 
 
-__version__ = "3.5.0"
+__version__ = "4.0.0"
 
 # ---------------------------------------------------------------------------
 #  CONSTANTS
@@ -73,6 +74,150 @@ REP_COLS: tuple[str, ...] = (
 REP_COL_WIDTHS: tuple[int, ...] = (40, 30, 100, 60, 90, 80, 90, 50)
 COL_PLOT = REP_COLS.index("Plot")
 COL_PARAM = REP_COLS.index("Param")
+
+
+# ---------------------------------------------------------------------------
+#  TEST TYPE REGISTRY
+# ---------------------------------------------------------------------------
+#
+# Every test type reduces to one formula:
+#
+#     Result = Peak Force (N) x factor / param        (uses_param = True)
+#     Result = Peak Force (N)                         (uses_param = False)
+#
+# ECT is factor 1 with param = specimen length in mm (N/mm == kN/m); FCT is
+# factor 10 with param = specimen area in cm² (N*10/cm² == kPa). Users can
+# define their own types (RCT, PAT, custom fixtures, ...) which are stored in
+# a JSON file under %APPDATA% so they survive app updates and rebuilds.
+
+BUILTIN_TEST_TYPES: dict[str, dict] = {
+    "Generic": {
+        "name": "Generic", "uses_param": False,
+        "param_label": "Param", "param_unit": "",
+        "factor": 1.0, "result_name": "Peak Force", "result_unit": "N",
+        "decimals": 1, "builtin": True,
+    },
+    "ECT": {
+        "name": "ECT", "uses_param": True,
+        "param_label": "Length", "param_unit": "mm",
+        "factor": 1.0, "result_name": "ECT", "result_unit": "kN/m",
+        "decimals": 2, "builtin": True,
+    },
+    "FCT": {
+        "name": "FCT", "uses_param": True,
+        "param_label": "Area", "param_unit": "cm²",
+        "factor": 10.0, "result_name": "FCT", "result_unit": "kPa",
+        "decimals": 1, "builtin": True,
+    },
+}
+
+# User-defined types, loaded from disk by the app at startup. Keyed by name;
+# never contains a key that shadows a builtin (validation forbids it).
+CUSTOM_TEST_TYPES: dict[str, dict] = {}
+
+
+def get_test_type(name: str) -> Optional[dict]:
+    """Look up a test type definition by name (builtins first)."""
+    return BUILTIN_TEST_TYPES.get(name) or CUSTOM_TEST_TYPES.get(name)
+
+
+def all_test_type_names() -> list[str]:
+    return list(BUILTIN_TEST_TYPES) + sorted(CUSTOM_TEST_TYPES)
+
+
+def param_column_label(tt: Optional[dict]) -> str:
+    """Human label for the per-sample parameter column, e.g. 'Area (cm²)'."""
+    if not tt or not tt.get("uses_param"):
+        return "Param"
+    unit = (tt.get("param_unit") or "").strip()
+    return f"{tt['param_label']} ({unit})" if unit else str(tt["param_label"])
+
+
+def result_column_label(tt: Optional[dict]) -> str:
+    """Human label for the computed-result column, e.g. 'ECT (kN/m)'."""
+    if not tt or not tt.get("uses_param"):
+        return "Peak (N)"
+    return f"{tt['result_name']} ({tt['result_unit']})"
+
+
+def validate_custom_test_type(d: dict) -> Optional[str]:
+    """Return a human-readable problem with a custom type dict, or None if OK."""
+    name = str(d.get("name", "")).strip()
+    if not name:
+        return "Give the test type a name (e.g. RCT)."
+    if name in BUILTIN_TEST_TYPES:
+        return f"'{name}' is a built-in type and cannot be replaced."
+    if not str(d.get("param_label", "")).strip():
+        return "Fill in the parameter label (what you divide by, e.g. Length)."
+    if not str(d.get("result_unit", "")).strip():
+        return "Fill in the result unit (e.g. kN/m)."
+    try:
+        factor = float(d.get("factor", 0))
+    except (TypeError, ValueError):
+        return "Multiplier must be a number."
+    if factor <= 0:
+        return "Multiplier must be greater than zero."
+    try:
+        dec = int(d.get("decimals", 2))
+    except (TypeError, ValueError):
+        return "Decimals must be a whole number between 0 and 4."
+    if not 0 <= dec <= 4:
+        return "Decimals must be between 0 and 4."
+    return None
+
+
+def normalize_custom_test_type(d: dict) -> dict:
+    """Coerce a validated editor/JSON dict into the canonical registry shape."""
+    name = str(d["name"]).strip()
+    return {
+        "name": name,
+        "uses_param": True,
+        "param_label": str(d["param_label"]).strip(),
+        "param_unit": str(d.get("param_unit", "")).strip(),
+        "factor": float(d["factor"]),
+        "result_name": name,
+        "result_unit": str(d["result_unit"]).strip(),
+        "decimals": int(d.get("decimals", 2)),
+        "builtin": False,
+    }
+
+
+def custom_test_types_path() -> Path:
+    """Per-user config location — works for the frozen exe too (the exe's own
+    folder may be read-only or OneDrive-synced; %APPDATA% is always writable).
+    """
+    base = os.environ.get("APPDATA") or str(Path.home())
+    return Path(base) / "CrushReader" / "test_types.json"
+
+
+def load_custom_test_types(path: Optional[Path] = None) -> dict[str, dict]:
+    """Read user-defined test types from disk. Invalid entries are skipped;
+    any IO/JSON problem yields an empty dict — the app must never fail to
+    start because of a bad config file.
+    """
+    p = path or custom_test_types_path()
+    try:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, dict] = {}
+    for entry in raw.get("types", []) if isinstance(raw, dict) else []:
+        if not isinstance(entry, dict):
+            continue
+        if validate_custom_test_type(entry) is None:
+            tt = normalize_custom_test_type(entry)
+            out[tt["name"]] = tt
+    return out
+
+
+def save_custom_test_types(customs: dict[str, dict],
+                           path: Optional[Path] = None) -> Path:
+    p = path or custom_test_types_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "types": [customs[k] for k in sorted(customs)]}
+    p.write_text(json.dumps(payload, indent=2, ensure_ascii=False),
+                 encoding="utf-8")
+    return p
 
 
 # ---------------------------------------------------------------------------
@@ -284,19 +429,20 @@ def apply_threshold_zeroing(
 def compute_value(sample: dict, test_type: str, param: float) -> dict:
     """Compute the test-specific value for a single replicate.
 
-    ``param`` is the specimen length in mm for ECT, the specimen area in cm²
-    for FCT, and ignored for Generic. Returns a dict with the display name,
-    value, unit, raw peak force, and the param used (so per-sample edits can
-    be displayed and exported).
+    ``test_type`` is looked up in the registry (builtin or user-defined);
+    ``param`` is that type's per-specimen divisor (length in mm for ECT, area
+    in cm² for FCT, ...), ignored for parameterless types. Returns a dict with
+    the display name, value, unit, raw peak force, and the param used (so
+    per-sample edits can be displayed and exported). An unknown type, a
+    non-positive param, or a parameterless type all fall back to peak force.
     """
     peak = max(sample["y_values"]) if sample["y_values"] else 0.0
-    if test_type == "ECT" and param > 0:
-        val = peak / param  # N/mm == kN/m, no conversion factor
-        return {"name": "ECT", "value": round(val, 2), "unit": "kN/m",
-                "peak_force": round(peak, 1), "param": param}
-    if test_type == "FCT" and param > 0:
-        val = peak * 10.0 / param  # kPa
-        return {"name": "FCT", "value": round(val, 1), "unit": "kPa",
+    tt = get_test_type(test_type)
+    if tt and tt.get("uses_param") and param > 0:
+        val = peak * tt["factor"] / param
+        return {"name": tt["result_name"],
+                "value": round(val, tt["decimals"]),
+                "unit": tt["result_unit"],
                 "peak_force": round(peak, 1), "param": param}
     return {"name": "Peak Force", "value": round(peak, 1), "unit": "N",
             "peak_force": round(peak, 1), "param": param}
@@ -543,8 +689,7 @@ def export_session_summary(
                 w.writerow([k.upper() if k != "cov" else "COV (%)", ps[k]])
             w.writerow([])
         # Per-replicate
-        param_col = {"ECT": "Length (mm)", "FCT": "Area (cm²)"}.get(
-            session.test_type, "Param")
+        param_col = param_column_label(get_test_type(session.test_type))
         header = ["#", "Included", "Sample ID", "Peak Force (N)",
                   param_col, f"{stats['name']} ({stats['unit']})" if stats else "Value"]
         for r in (session.samples[0]["results"] if session.samples else []):
@@ -948,11 +1093,21 @@ def _resource_path(relative: str) -> str:
     return os.path.join(base, relative)
 
 
+# App palette — Virginia Tech maroon accent on a light neutral workspace.
+VT_MAROON = "#861F41"
+VT_MAROON_DARK = "#6b1934"
+APP_BG = "#f2f3f5"
+TEXT_MUTED = "#6a6f7a"
+STATUS_OK = "#2e7d32"
+STATUS_BAD = "#c0392b"
+STATUS_IDLE = "#5e6470"
+
+
 class CrushReaderApp:
     def __init__(self) -> None:
         self.root = tk.Tk()
         self.root.title(f"ABB Crush Tester Data Reader  v{__version__}")
-        self.root.geometry("1250x860")
+        self.root.geometry("1250x880")
         self.root.minsize(1050, 720)
         # Window icon (taskbar + title bar)
         ico = _resource_path("corrugated_crush_icon.ico")
@@ -965,14 +1120,56 @@ class CrushReaderApp:
         self.output_dir: str = ""
         self.session: Optional[TestSession] = None
         self.threshold_var = tk.StringVar(value=str(int(DEFAULT_THRESHOLD_N)))
+        CUSTOM_TEST_TYPES.update(load_custom_test_types())
+        self._setup_style()
         self._build_ui()
 
     # ========== UI ==========
 
+    def _setup_style(self):
+        """One flat, light theme for the whole app. 'clam' is the only ttk
+        theme that honors color configuration on every platform, so it is the
+        base; everything else is explicit."""
+        style = ttk.Style(self.root)
+        try:
+            style.theme_use("clam")
+        except tk.TclError:
+            pass
+        base_font = ("Segoe UI", 10)
+        self.root.configure(bg=APP_BG)
+        style.configure(".", background=APP_BG, foreground="#1f2430",
+                        font=base_font)
+        style.configure("TLabelframe", background=APP_BG,
+                        bordercolor="#d8dade", relief="solid", borderwidth=1)
+        style.configure("TLabelframe.Label", background=APP_BG,
+                        foreground=VT_MAROON, font=("Segoe UI", 10, "bold"))
+        style.configure("TButton", padding=(10, 4))
+        style.configure("Accent.TButton", background=VT_MAROON,
+                        foreground="white", bordercolor=VT_MAROON)
+        style.map("Accent.TButton",
+                  background=[("disabled", "#c3c6cc"),
+                              ("active", VT_MAROON_DARK)],
+                  foreground=[("disabled", "#f0f0f0")])
+        style.configure("TEntry", padding=2)
+        # Row height must track font metrics or text clips on high-DPI
+        # displays where a hardcoded pixel height is too short.
+        from tkinter import font as tkfont
+        row_h = tkfont.Font(root=self.root, font=base_font).metrics("linespace") + 8
+        style.configure("Treeview", rowheight=row_h, background="white",
+                        fieldbackground="white", borderwidth=0)
+        style.configure("Treeview.Heading", font=("Segoe UI", 9, "bold"),
+                        background="#e7e9ee", relief="flat")
+        style.map("Treeview.Heading", background=[("active", "#dcdfe6")])
+        style.map("Treeview",
+                  background=[("selected", VT_MAROON)],
+                  foreground=[("selected", "white")])
+        style.configure("Muted.TLabel", foreground=TEXT_MUTED)
+
     def _build_ui(self):
+        self._build_header(self.root)
         self._build_session_bar(self.root)
         main = ttk.PanedWindow(self.root, orient=tk.HORIZONTAL)
-        main.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        main.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         left = ttk.Frame(main, width=340)
         main.add(left, weight=1)
         right = ttk.Frame(main)
@@ -984,14 +1181,37 @@ class CrushReaderApp:
         self._build_summary_panel(right)
         self._build_plot_panel(right)
 
+    def _build_header(self, parent):
+        hdr = tk.Frame(parent, bg=VT_MAROON)
+        hdr.pack(fill=tk.X)
+        tk.Label(hdr, text="ABB Crush Tester", bg=VT_MAROON, fg="white",
+                 font=("Segoe UI", 14, "bold")).pack(side=tk.LEFT,
+                                                     padx=(14, 6), pady=8)
+        tk.Label(hdr, text=f"Data Reader · v{__version__}", bg=VT_MAROON,
+                 fg="#dcb6c3", font=("Segoe UI", 10)).pack(side=tk.LEFT, pady=8)
+        self.status_pill = tk.Label(
+            hdr, text="●  Not connected", bg=STATUS_IDLE, fg="white",
+            font=("Segoe UI", 9, "bold"), padx=12, pady=4)
+        self.status_pill.pack(side=tk.RIGHT, padx=14)
+
     def _build_session_bar(self, parent):
         bar = ttk.Frame(parent)
-        bar.pack(fill=tk.X, padx=6, pady=(6, 2))
-        ttk.Button(bar, text="New Session", command=self._new_session_dialog).pack(side=tk.LEFT)
-        ttk.Button(bar, text="Import Files...", command=self._import_batch).pack(side=tk.LEFT, padx=(6, 0))
-        self.session_label = ttk.Label(bar, text="No active session", font=("Segoe UI", 10))
+        bar.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Button(bar, text="New Session", style="Accent.TButton",
+                   command=self._new_session_dialog).pack(side=tk.LEFT)
+        ttk.Button(bar, text="Import Files...",
+                   command=self._import_batch).pack(side=tk.LEFT, padx=(6, 0))
+        self.rename_btn = ttk.Button(bar, text="Rename", width=8,
+                                     command=self._rename_session,
+                                     state=tk.DISABLED)
+        self.rename_btn.pack(side=tk.LEFT, padx=(6, 0))
+        self.session_label = ttk.Label(bar, text="No active session",
+                                       font=("Segoe UI", 10, "bold"))
         self.session_label.pack(side=tk.LEFT, padx=12)
-        self.export_btn = ttk.Button(bar, text="Export Summary CSV", command=self._export_summary, state=tk.DISABLED)
+        self.export_btn = ttk.Button(bar, text="Export Results",
+                                     style="Accent.TButton",
+                                     command=self._export_summary,
+                                     state=tk.DISABLED)
         self.export_btn.pack(side=tk.RIGHT)
 
     def _build_settings_panel(self, parent):
@@ -1030,28 +1250,27 @@ class CrushReaderApp:
 
         bf = ttk.Frame(frame)
         bf.grid(row=r+2, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
-        self.connect_btn = ttk.Button(bf, text="Connect & Monitor", command=self._toggle_mon)
+        self.connect_btn = ttk.Button(bf, text="Connect & Monitor",
+                                      style="Accent.TButton",
+                                      command=self._toggle_mon)
         self.connect_btn.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.refresh_btn = ttk.Button(bf, text="Refresh", width=7, command=self._force_refresh, state=tk.DISABLED)
         self.refresh_btn.pack(side=tk.RIGHT, padx=(4,0))
-        sf = ttk.Frame(frame)
-        sf.grid(row=r+3, column=0, columnspan=2, sticky=tk.EW, pady=(6,0))
-        self.status_dot = tk.Canvas(sf, width=12, height=12, highlightthickness=0)
-        self.status_dot.pack(side=tk.LEFT); self._draw_dot("gray")
-        self.status_label = ttk.Label(sf, text="Not connected")
-        self.status_label.pack(side=tk.LEFT, padx=4)
 
     def _build_test_params_panel(self, parent):
-        frame = ttk.LabelFrame(parent, text="Test Parameters", padding=8)
+        frame = ttk.LabelFrame(parent, text="Test Setup", padding=8)
         frame.pack(fill=tk.X, padx=4, pady=(0, 4))
         # Test type
         r1 = ttk.Frame(frame); r1.pack(fill=tk.X)
         ttk.Label(r1, text="Test type:").pack(side=tk.LEFT)
         self.test_type_var = tk.StringVar(value="Generic")
-        cb = ttk.Combobox(r1, textvariable=self.test_type_var,
-                          values=["Generic", "ECT", "FCT"], state="readonly", width=10)
-        cb.pack(side=tk.LEFT, padx=4)
-        cb.bind("<<ComboboxSelected>>", self._on_test_type_changed)
+        self.type_combo = ttk.Combobox(
+            r1, textvariable=self.test_type_var,
+            values=all_test_type_names(), state="readonly", width=12)
+        self.type_combo.pack(side=tk.LEFT, padx=4)
+        self.type_combo.bind("<<ComboboxSelected>>", self._on_test_type_changed)
+        ttk.Button(r1, text="Manage...", width=9,
+                   command=self._manage_types_dialog).pack(side=tk.RIGHT)
         # Default param
         self.param_container = ttk.Frame(frame)
         self.param_container.pack(fill=tk.X, pady=(4,0))
@@ -1067,20 +1286,20 @@ class CrushReaderApp:
     def _update_param_fields(self):
         for w in self.param_container.winfo_children():
             w.destroy()
-        tt = self.test_type_var.get()
-        if tt in ("ECT", "FCT"):
-            label_text = "Default length:" if tt == "ECT" else "Default area:"
-            unit_text = "mm" if tt == "ECT" else "cm²"
+        tt = get_test_type(self.test_type_var.get())
+        if tt and tt.get("uses_param"):
+            label_text = f"Default {tt['param_label'].lower()}:"
             ttk.Label(self.param_container, text=label_text).pack(side=tk.LEFT)
             self.param_var.set(str(DEFAULT_PARAM_VALUE))
             ttk.Entry(self.param_container, textvariable=self.param_var,
                       width=8).pack(side=tk.LEFT, padx=4)
-            ttk.Label(self.param_container, text=unit_text).pack(side=tk.LEFT)
+            ttk.Label(self.param_container,
+                      text=tt.get("param_unit", "")).pack(side=tk.LEFT)
             ttk.Button(self.param_container, text="Apply to all",
                        command=self._apply_param_all, width=10).pack(side=tk.RIGHT)
         else:
             ttk.Label(self.param_container, text="Reports peak load",
-                      foreground="gray").pack(side=tk.LEFT)
+                      style="Muted.TLabel").pack(side=tk.LEFT)
 
     def _on_test_type_changed(self, event=None):
         self._update_param_fields()
@@ -1118,17 +1337,21 @@ class CrushReaderApp:
     def _build_log_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Log", padding=4)
         frame.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
-        self.log_text = scrolledtext.ScrolledText(frame, height=8, wrap=tk.WORD,
-                                                   font=("Consolas", 9), state=tk.DISABLED)
+        self.log_text = scrolledtext.ScrolledText(
+            frame, height=8, wrap=tk.WORD, font=("Consolas", 9),
+            state=tk.DISABLED, bg="#22262e", fg="#c9d1d9",
+            insertbackground="#c9d1d9", relief=tk.FLAT, borderwidth=0)
         self.log_text.pack(fill=tk.BOTH, expand=True)
 
     def _build_replicates_panel(self, parent):
         frame = ttk.LabelFrame(
             parent,
-            text="Replicates  (double-click param to edit, click Plot to toggle)",
+            text="Replicates  (click Plot to include/exclude · double-click "
+                 "param to edit · right-click for more)",
             padding=4)
         frame.pack(fill=tk.X, padx=4, pady=(0, 2))
-        self.meta_label = ttk.Label(frame, text="No active session", foreground="gray")
+        self.meta_label = ttk.Label(frame, text="No active session",
+                                    style="Muted.TLabel")
         self.meta_label.pack(anchor=tk.W)
         self.rep_tree = ttk.Treeview(
             frame, columns=REP_COLS, show="headings",
@@ -1136,6 +1359,10 @@ class CrushReaderApp:
         for col, w in zip(REP_COLS, REP_COL_WIDTHS):
             self.rep_tree.heading(col, text=col)
             self.rep_tree.column(col, width=w, minwidth=w)
+        # Row appearance: zebra striping; excluded rows are dimmed.
+        self.rep_tree.tag_configure("odd", background="#f6f7f9")
+        self.rep_tree.tag_configure("even", background="white")
+        self.rep_tree.tag_configure("excluded", foreground="#9aa0aa")
         sb = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=self.rep_tree.yview)
         self.rep_tree.configure(yscrollcommand=sb.set)
         self.rep_tree.pack(side=tk.LEFT, fill=tk.X, expand=True, pady=(4, 0))
@@ -1143,6 +1370,19 @@ class CrushReaderApp:
         self.rep_tree.bind("<Double-1>", self._on_tree_double_click)
         self.rep_tree.bind("<ButtonRelease-1>", self._on_tree_click)
         self.rep_tree.bind("<<TreeviewSelect>>", self._on_tree_select)
+        self.rep_tree.bind("<Button-3>", self._show_tree_menu)
+        # Right-click context menu — the discoverable path to every per-row
+        # action (the click/double-click gestures stay as shortcuts).
+        self.tree_menu = tk.Menu(self.rep_tree, tearoff=0)
+        self.tree_menu.add_command(label="Include / exclude from results",
+                                   command=self._ctx_toggle_include)
+        self.tree_menu.add_command(label="Edit parameter...",
+                                   command=self._ctx_edit_param)
+        self.tree_menu.add_separator()
+        self.tree_menu.add_command(label="Include all replicates",
+                                   command=self._ctx_include_all)
+        self.tree_menu.add_command(label="Exclude all others",
+                                   command=self._ctx_exclude_others)
 
     def _clicked_col_index(self, event) -> Optional[int]:
         """Return the 0-based index of the column at the click, or None if
@@ -1158,11 +1398,17 @@ class CrushReaderApp:
         except ValueError:
             return None
 
+    ONBOARDING_HINT = (
+        "No data yet.  ①  Pick a Save-to folder    ②  Connect & Monitor    "
+        "③  Run your test — replicates appear here automatically.\n"
+        "(Working from saved files instead?  Use Import Files... above.)")
+
     def _build_summary_panel(self, parent):
         frame = ttk.LabelFrame(parent, text="Session Summary", padding=4)
         frame.pack(fill=tk.X, padx=4, pady=(0, 2))
-        self.summary_text = ttk.Label(frame, text="Start a session to see statistics",
-                                      foreground="gray", wraplength=750, justify=tk.LEFT)
+        self.summary_text = ttk.Label(frame, text=self.ONBOARDING_HINT,
+                                      style="Muted.TLabel",
+                                      wraplength=750, justify=tk.LEFT)
         self.summary_text.pack(anchor=tk.W, fill=tk.X)
         self.machine_summary_label = ttk.Label(frame, text="", foreground="#555",
                                                wraplength=750, justify=tk.LEFT)
@@ -1183,10 +1429,6 @@ class CrushReaderApp:
 
     # ========== HELPERS ==========
 
-    def _draw_dot(self, c):
-        self.status_dot.delete("all")
-        self.status_dot.create_oval(2,2,10,10, fill=c, outline=c)
-
     def _log(self, m):
         ts = datetime.now().strftime("%H:%M:%S")
         self.root.after(0, self._append_log, f"[{ts}] {m}")
@@ -1200,8 +1442,8 @@ class CrushReaderApp:
         self.root.after(0, self._set_status_ui, m, c)
 
     def _set_status_ui(self, m, c):
-        self.status_label.config(text=m)
-        self._draw_dot("#2ecc71" if c else "#e74c3c")
+        self.status_pill.config(text=f"●  {m}",
+                                bg=STATUS_OK if c else STATUS_BAD)
 
     def _pick_dir(self):
         p = filedialog.askdirectory(title="Choose output folder")
@@ -1239,7 +1481,8 @@ class CrushReaderApp:
         idx = int(iid)
         if not self.session or idx >= self.session.count:
             return
-        if self.session.test_type == "Generic":
+        tt = get_test_type(self.session.test_type)
+        if not (tt and tt.get("uses_param")):
             return  # nothing to edit
 
         bbox = self.rep_tree.bbox(iid, column=REP_COLS[COL_PARAM])
@@ -1275,7 +1518,85 @@ class CrushReaderApp:
         """Highlight selected curve."""
         self._update_plot()
 
+    # ---- right-click context menu ----
+
+    def _show_tree_menu(self, event):
+        iid = self.rep_tree.identify_row(event.y)
+        if not iid or not self.session:
+            return
+        self.rep_tree.selection_set(iid)
+        # Only parameterized types have anything to edit in the Param column.
+        tt = get_test_type(self.session.test_type)
+        state = tk.NORMAL if (tt and tt.get("uses_param")) else tk.DISABLED
+        self.tree_menu.entryconfig("Edit parameter...", state=state)
+        self.tree_menu.tk_popup(event.x_root, event.y_root)
+
+    def _selected_row_index(self) -> Optional[int]:
+        sel = self.rep_tree.selection()
+        if not sel or not self.session:
+            return None
+        idx = int(sel[0])
+        return idx if idx < self.session.count else None
+
+    def _refresh_after_data_change(self):
+        self._update_session_label()
+        self._refresh_table()
+        self._update_summary()
+        self._update_plot()
+
+    def _ctx_toggle_include(self):
+        idx = self._selected_row_index()
+        if idx is None:
+            return
+        self.session.toggle_included(idx)
+        self._refresh_after_data_change()
+
+    def _ctx_edit_param(self):
+        idx = self._selected_row_index()
+        if idx is None:
+            return
+        tt = get_test_type(self.session.test_type)
+        if not (tt and tt.get("uses_param")):
+            return
+        new_val = simpledialog.askfloat(
+            "Edit parameter",
+            f"{param_column_label(tt)} for replicate #{idx + 1}:",
+            parent=self.root, initialvalue=self.session.sample_params[idx],
+            minvalue=1e-9)
+        if new_val is None:
+            return
+        self.session.update_param(idx, new_val)
+        self._log(f"Sample #{idx + 1} param -> {new_val}")
+        self._refresh_after_data_change()
+
+    def _ctx_include_all(self):
+        if not self.session:
+            return
+        for i in range(self.session.count):
+            self.session.included[i] = True
+        self._refresh_after_data_change()
+
+    def _ctx_exclude_others(self):
+        idx = self._selected_row_index()
+        if idx is None:
+            return
+        for i in range(self.session.count):
+            self.session.included[i] = (i == idx)
+        self._refresh_after_data_change()
+
     # ========== SESSION MANAGEMENT ==========
+
+    def _rename_session(self):
+        if not self.session:
+            return
+        name = simpledialog.askstring(
+            "Rename session", "Project / sample name:",
+            parent=self.root, initialvalue=self.session.project_name)
+        if name is None:
+            return
+        self.session.project_name = name.strip()
+        self._log(f"Session renamed to '{self.session.project_name}'")
+        self._refresh_after_data_change()
 
     def _new_session_dialog(self):
         if self.session and self.session.count > 0:
@@ -1295,7 +1616,7 @@ class CrushReaderApp:
 
         ttk.Label(dlg, text="Test Type:").pack(anchor=tk.W, padx=12, pady=(8,2))
         tv = tk.StringVar(value=self.test_type_var.get())
-        ttk.Combobox(dlg, textvariable=tv, values=["Generic","ECT","FCT"],
+        ttk.Combobox(dlg, textvariable=tv, values=all_test_type_names(),
                      state="readonly", width=14).pack(anchor=tk.W, padx=12)
 
         ttk.Label(dlg, text="(Leave name blank to auto-fill from machine)",
@@ -1322,13 +1643,252 @@ class CrushReaderApp:
 
     def _update_session_label(self):
         if not self.session:
-            self.session_label.config(text="No active session"); return
+            self.session_label.config(text="No active session")
+            self.rename_btn.config(state=tk.DISABLED)
+            return
         s = self.session
         name = s.project_name or "(waiting for first sample)"
         n_inc = len(s.get_included_indices())
         self.session_label.config(
             text=f"Session: {name}  |  {s.test_type}  |  "
                  f"{n_inc}/{s.count} included")
+        self.rename_btn.config(state=tk.NORMAL)
+
+    # ========== TEST TYPE MANAGEMENT ==========
+
+    def _save_custom_types(self):
+        try:
+            save_custom_test_types(CUSTOM_TEST_TYPES)
+        except OSError as e:
+            messagebox.showwarning(
+                "Could not save",
+                f"Your test types could not be saved to disk:\n{e}\n\n"
+                "They will still work until you close the app.")
+
+    def _refresh_type_choices(self):
+        """Sync every place a test type can be picked after the registry
+        changed, and recompute the open session against the new definitions.
+        """
+        names = all_test_type_names()
+        self.type_combo["values"] = names
+        if self.test_type_var.get() not in names:
+            # The selected type was deleted/renamed — fall back to Generic.
+            self.test_type_var.set("Generic")
+            self._update_param_fields()
+            if self.session:
+                self._apply_param_all()
+                return
+        if self.session:
+            # Recompute in place with unchanged per-sample params, in case
+            # the session's type definition was just edited.
+            for i, p in enumerate(self.session.sample_params):
+                self.session.update_param(i, p)
+            self._refresh_after_data_change()
+
+    def _manage_types_dialog(self):
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Test Types")
+        dlg.geometry("560x340")
+        dlg.transient(self.root); dlg.grab_set()
+        dlg.configure(bg=APP_BG)
+
+        ttk.Label(dlg,
+                  text="Built-in types cannot be changed. Create your own "
+                       "for any test that divides peak force by a specimen "
+                       "dimension (RCT, PAT, custom fixtures, ...).",
+                  style="Muted.TLabel", wraplength=530,
+                  justify=tk.LEFT).pack(anchor=tk.W, padx=12, pady=(10, 6))
+
+        body = ttk.Frame(dlg); body.pack(fill=tk.BOTH, expand=True, padx=12)
+        lb = tk.Listbox(body, font=("Segoe UI", 10), activestyle="none",
+                        relief=tk.FLAT, highlightthickness=1,
+                        highlightbackground="#d8dade")
+        sb = ttk.Scrollbar(body, orient=tk.VERTICAL, command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        lb.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+
+        def describe(tt: dict) -> str:
+            if not tt.get("uses_param"):
+                return f"{tt['name']}  —  peak force only"
+            f = tt["factor"]
+            mult = "" if f == 1 else f"× {f:g}  "
+            txt = (f"{tt['name']}  =  Peak (N)  {mult}÷  "
+                   f"{param_column_label(tt)}   →   {tt['result_unit']}")
+            if tt.get("builtin"):
+                txt += "    [built-in]"
+            return txt
+
+        def refresh_list():
+            lb.delete(0, tk.END)
+            for name in all_test_type_names():
+                lb.insert(tk.END, describe(get_test_type(name)))
+
+        def selected_name() -> Optional[str]:
+            sel = lb.curselection()
+            return all_test_type_names()[sel[0]] if sel else None
+
+        def after_change(select_name: Optional[str]):
+            refresh_list()
+            self._refresh_type_choices()
+            if select_name:
+                names = all_test_type_names()
+                lb.selection_clear(0, tk.END)
+                lb.selection_set(names.index(select_name))
+
+        def on_new():
+            tt = self._edit_type_dialog(dlg, None)
+            if tt:
+                after_change(tt["name"])
+
+        def on_edit():
+            name = selected_name()
+            if not name:
+                return
+            tt = get_test_type(name)
+            if tt.get("builtin"):
+                messagebox.showinfo(
+                    "Built-in type",
+                    f"'{name}' is built in and cannot be edited.\n"
+                    "Create a new type instead.", parent=dlg)
+                return
+            new_tt = self._edit_type_dialog(dlg, tt)
+            if new_tt:
+                after_change(new_tt["name"])
+
+        def on_delete():
+            name = selected_name()
+            if not name:
+                return
+            if get_test_type(name).get("builtin"):
+                messagebox.showinfo(
+                    "Built-in type",
+                    f"'{name}' is built in and cannot be deleted.", parent=dlg)
+                return
+            if not messagebox.askyesno(
+                    "Delete test type", f"Delete '{name}'?", parent=dlg):
+                return
+            del CUSTOM_TEST_TYPES[name]
+            self._save_custom_types()
+            self._log(f"Test type deleted: {name}")
+            after_change(None)
+
+        lb.bind("<Double-1>", lambda e: on_edit())
+        btns = ttk.Frame(dlg); btns.pack(fill=tk.X, padx=12, pady=10)
+        ttk.Button(btns, text="New...", style="Accent.TButton",
+                   command=on_new).pack(side=tk.LEFT)
+        ttk.Button(btns, text="Edit...", command=on_edit).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btns, text="Delete", command=on_delete).pack(
+            side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btns, text="Close", command=dlg.destroy).pack(side=tk.RIGHT)
+        refresh_list()
+
+    def _edit_type_dialog(self, parent,
+                          existing: Optional[dict]) -> Optional[dict]:
+        """Create/edit one custom test type. Returns the saved definition,
+        or None if the user cancelled."""
+        dlg = tk.Toplevel(parent)
+        dlg.title("New Test Type" if existing is None
+                  else f"Edit Test Type — {existing['name']}")
+        dlg.transient(parent); dlg.grab_set()
+        dlg.configure(bg=APP_BG)
+        dlg.resizable(False, False)
+
+        frm = ttk.Frame(dlg, padding=14)
+        frm.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(frm,
+                  text="Result  =  Peak Force (N)  ×  multiplier  ÷  parameter",
+                  font=("Segoe UI", 10, "bold"),
+                  foreground=VT_MAROON).grid(
+            row=0, column=0, columnspan=3, sticky=tk.W, pady=(0, 10))
+
+        name_v = tk.StringVar(value=existing["name"] if existing else "")
+        plabel_v = tk.StringVar(
+            value=existing["param_label"] if existing else "Length")
+        punit_v = tk.StringVar(
+            value=existing["param_unit"] if existing else "mm")
+        factor_v = tk.StringVar(
+            value=f"{existing['factor']:g}" if existing else "1")
+        runit_v = tk.StringVar(
+            value=existing["result_unit"] if existing else "kN/m")
+        dec_v = tk.StringVar(
+            value=str(existing["decimals"]) if existing else "2")
+
+        rows = [
+            ("Test name:", name_v, "e.g. RCT"),
+            ("Parameter label:", plabel_v, "what you divide by, e.g. Length"),
+            ("Parameter unit:", punit_v, "e.g. mm"),
+            ("Multiplier:", factor_v, "1 for N/mm → kN/m,  10 for N/cm² → kPa"),
+            ("Result unit:", runit_v, "e.g. kN/m"),
+            ("Decimals:", dec_v, "0–4"),
+        ]
+        for i, (lbl, var, hint) in enumerate(rows, start=1):
+            ttk.Label(frm, text=lbl).grid(row=i, column=0, sticky=tk.W, pady=2)
+            ttk.Entry(frm, textvariable=var, width=14).grid(
+                row=i, column=1, sticky=tk.W, padx=(6, 10), pady=2)
+            ttk.Label(frm, text=hint, style="Muted.TLabel").grid(
+                row=i, column=2, sticky=tk.W, pady=2)
+
+        preview = ttk.Label(frm, text=" ", style="Muted.TLabel")
+        preview.grid(row=len(rows) + 1, column=0, columnspan=3,
+                     sticky=tk.W, pady=(10, 0))
+
+        def current_dict() -> dict:
+            return {"name": name_v.get(), "param_label": plabel_v.get(),
+                    "param_unit": punit_v.get(), "factor": factor_v.get(),
+                    "result_unit": runit_v.get(), "decimals": dec_v.get()}
+
+        def update_preview(*_):
+            d = current_dict()
+            if validate_custom_test_type(d) is None:
+                tt = normalize_custom_test_type(d)
+                val = round(2000.0 * tt["factor"] / 100.0, tt["decimals"])
+                unit = f" {tt['param_unit']}" if tt["param_unit"] else ""
+                preview.config(
+                    text=f"Example:  peak 2000 N,  {tt['param_label']} = 100"
+                         f"{unit}   →   {tt['result_name']} = "
+                         f"{val} {tt['result_unit']}")
+            else:
+                preview.config(text=" ")
+
+        for var in (name_v, plabel_v, punit_v, factor_v, runit_v, dec_v):
+            var.trace_add("write", update_preview)
+        update_preview()
+
+        result: dict = {}
+
+        def save():
+            d = current_dict()
+            err = validate_custom_test_type(d)
+            if err is None:
+                new_name = str(d["name"]).strip()
+                if new_name in CUSTOM_TEST_TYPES and (
+                        existing is None or new_name != existing["name"]):
+                    err = f"A test type named '{new_name}' already exists."
+            if err:
+                messagebox.showwarning("Check the form", err, parent=dlg)
+                return
+            tt = normalize_custom_test_type(d)
+            if existing is not None and existing["name"] != tt["name"]:
+                CUSTOM_TEST_TYPES.pop(existing["name"], None)
+            CUSTOM_TEST_TYPES[tt["name"]] = tt
+            self._save_custom_types()
+            self._log(f"Test type saved: {tt['name']} "
+                      f"(× {tt['factor']:g} ÷ {tt['param_label']}, "
+                      f"→ {tt['result_unit']})")
+            result.update(tt)
+            dlg.destroy()
+
+        bf = ttk.Frame(frm)
+        bf.grid(row=len(rows) + 2, column=0, columnspan=3,
+                pady=(14, 0), sticky=tk.E)
+        ttk.Button(bf, text="Save", style="Accent.TButton",
+                   command=save).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(bf, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT)
+        dlg.bind("<Return>", lambda e: save())
+        dlg.wait_window()
+        return result or None
 
     # ========== MONITORING ==========
 
@@ -1573,12 +2133,14 @@ class CrushReaderApp:
     def _refresh_table(self):
         for i in self.rep_tree.get_children(): self.rep_tree.delete(i)
         if not self.session or not self.session.samples:
-            self.meta_label.config(text="No replicates yet", foreground="gray"); return
+            self.meta_label.config(text="No replicates yet",
+                                   foreground=TEXT_MUTED); return
         s = self.session
-        param_label = {"ECT": "Length (mm)", "FCT": "Area (cm²)"}.get(s.test_type, "—")
-        self.rep_tree.heading("Param", text=param_label)
-        comp_label = {"ECT": "ECT (kN/m)", "FCT": "FCT (kPa)"}.get(s.test_type, "Peak (N)")
-        self.rep_tree.heading("Computed", text=comp_label)
+        tt = get_test_type(s.test_type)
+        uses_param = bool(tt and tt.get("uses_param"))
+        self.rep_tree.heading(
+            "Param", text=param_column_label(tt) if uses_param else "—")
+        self.rep_tree.heading("Computed", text=result_column_label(tt))
         n_inc = len(s.get_included_indices())
         self.meta_label.config(
             text=f"{s.project_name}  |  {s.test_type}  |  {n_inc}/{s.count} included",
@@ -1586,20 +2148,26 @@ class CrushReaderApp:
         for i, sample in enumerate(s.samples):
             c = sample.get("computed", {})
             check = "✓" if s.included[i] else ""
-            param_val = s.sample_params[i] if s.test_type != "Generic" else ""
+            param_val = s.sample_params[i] if uses_param else ""
+            tags = ["odd" if i % 2 else "even"]
+            if not s.included[i]:
+                tags.append("excluded")
             self.rep_tree.insert("", tk.END, iid=str(i), values=(
                 check, i+1, sample["sample_id"], sample["sample_no"],
                 c.get("peak_force", ""),
-                param_val, c.get("value", ""), c.get("unit", "")))
+                param_val, c.get("value", ""), c.get("unit", "")),
+                tags=tags)
 
     # ========== SUMMARY ==========
 
     def _update_summary(self):
         if not self.session or self.session.count == 0:
-            self.summary_text.config(text="No data yet", foreground="gray"); return
+            self.summary_text.config(text=self.ONBOARDING_HINT,
+                                     foreground=TEXT_MUTED); return
         st = self.session.get_summary_stats()
         if not st:
-            self.summary_text.config(text="No included samples", foreground="gray"); return
+            self.summary_text.config(text="No included samples",
+                                     foreground=TEXT_MUTED); return
         txt = (f"{st['name']}:  Mean = {st['mean']} {st['unit']},  "
                f"Std = {st['std']},  COV = {st['cov']}%,  "
                f"Range = [{st['min']} – {st['max']}]  (n={st['n']})")
@@ -1666,10 +2234,15 @@ class CrushReaderApp:
         fm.add_command(label="Import Files...", command=self._import_batch)
         fm.add_separator()
         fm.add_command(label="New Session...", command=self._new_session_dialog)
-        fm.add_command(label="Export Summary", command=self._export_summary)
+        fm.add_command(label="Rename Session...", command=self._rename_session)
+        fm.add_command(label="Export Results", command=self._export_summary)
         fm.add_separator()
         fm.add_command(label="Exit", command=self._on_close)
         mb.add_cascade(label="File", menu=fm)
+        tm = tk.Menu(mb, tearoff=0)
+        tm.add_command(label="Manage Test Types...",
+                       command=self._manage_types_dialog)
+        mb.add_cascade(label="Tools", menu=tm)
         self.root.config(menu=mb)
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()

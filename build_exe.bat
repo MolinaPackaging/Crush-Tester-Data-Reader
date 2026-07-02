@@ -10,7 +10,8 @@ REM  synced project folder). OneDrive locks files mid-write, which
 REM  makes PyInstaller's --clean fail with "Access is denied", so
 REM  we build in %TEMP% and copy just the finished .exe back.
 REM
-REM  Result: dist\CrushReader.exe  -> copy to the lab computer.
+REM  Result: dist\CrushReader_v<version>.exe  -> copy to the lab computer.
+REM  The version in the name comes from __version__ in crush_reader.py.
 REM ============================================================
 
 echo.
@@ -77,6 +78,35 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- Make the base interpreter's DLLs visible to PyInstaller ------------
+REM  With Anaconda/conda Python, binary dependencies of C extensions
+REM  (ffi-8.dll for _ctypes, and friends) live in <base>\Library\bin,
+REM  which is only on PATH inside an "Anaconda Prompt". If the build runs
+REM  from a plain window, PyInstaller's dependency scan can't find those
+REM  DLLs, SILENTLY leaves them out, and the exe dies on launch with
+REM  "DLL load failed while importing _ctypes". Putting the folder on
+REM  PATH here makes the build correct no matter how it was started.
+set "PYBASE="
+for /f "delims=" %%B in ('%VPY% -c "import sys;print(sys.base_prefix)"') do set "PYBASE=%%B"
+if defined PYBASE if exist "%PYBASE%\Library\bin" (
+    echo Using base interpreter DLLs from: %PYBASE%\Library\bin
+    set "PATH=%PYBASE%\Library\bin;%PATH%"
+)
+
+REM --- Read the app version so the exe name says which build it is --------
+REM  Pulls the X.Y.Z out of the  __version__ = "X.Y.Z"  line, so the exe is
+REM  named e.g. CrushReader_v4.0.0.exe and can't be confused with older ones.
+set "VERSION="
+for /f tokens^=2^ delims^=^" %%V in ('findstr /b /c:"__version__" crush_reader.py') do set "VERSION=%%V"
+if defined VERSION (
+    set "EXENAME=CrushReader_v%VERSION%"
+) else (
+    echo WARNING: Could not read __version__ from crush_reader.py.
+    set "EXENAME=CrushReader"
+)
+echo Building %EXENAME%.exe
+echo.
+
 echo [3/4] Building executable (this takes 1-2 minutes)...
 REM  Build in a LOCAL temp folder so OneDrive can't lock the work files.
 set "BUILDTMP=%TEMP%\CrushReaderBuild"
@@ -85,7 +115,7 @@ mkdir "%BUILDTMP%" 2>nul
 "%VPY%" -m PyInstaller ^
     --onefile ^
     --windowed ^
-    --name CrushReader ^
+    --name %EXENAME% ^
     --noconfirm ^
     --clean ^
     --workpath "%BUILDTMP%\build" ^
@@ -111,13 +141,29 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM --- Sanity check: the ffi DLL must be inside the bundle ----------------
+REM  Every Python build ships an ffi DLL next to _ctypes (libffi-8.dll for
+REM  python.org, ffi-8.dll in conda's Library\bin). If it's absent from the
+REM  archive, the exe WILL crash on startup, so fail loudly now instead of
+REM  shipping a broken file to the lab computer.
+%VPY% -m PyInstaller.utils.cliutils.archive_viewer -l "%BUILDTMP%\dist\%EXENAME%.exe" | findstr /i "ffi" >nul
+if errorlevel 1 (
+    echo.
+    echo ERROR: The built exe is missing the ffi DLL that _ctypes needs.
+    echo   It would crash on launch with "DLL load failed while importing
+    echo   _ctypes". This usually means the Python DLL folder was not on
+    echo   PATH during the build. Not copying the broken exe to dist\.
+    pause
+    exit /b 1
+)
+
 REM Copy the finished exe out of temp into the project's dist\ folder.
 if not exist dist mkdir dist
-copy /y "%BUILDTMP%\dist\CrushReader.exe" "dist\CrushReader.exe" >nul
+copy /y "%BUILDTMP%\dist\%EXENAME%.exe" "dist\%EXENAME%.exe" >nul
 if errorlevel 1 (
     echo.
     echo ERROR: Built the exe but could not copy it into dist\.
-    echo   The finished file is here: %BUILDTMP%\dist\CrushReader.exe
+    echo   The finished file is here: %BUILDTMP%\dist\%EXENAME%.exe
     echo   ^(If OneDrive is syncing, pause it and copy that file manually.^)
     pause
     exit /b 1
@@ -130,7 +176,7 @@ echo [4/4] Done!
 echo.
 echo ============================================================
 echo   Your executable is ready:
-echo   %CD%\dist\CrushReader.exe
+echo   %CD%\dist\%EXENAME%.exe
 echo.
 echo   Copy this single file to the lab computer and run it.
 echo   No Python or other software needed on the lab machine.

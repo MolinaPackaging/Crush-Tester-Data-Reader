@@ -25,6 +25,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from crush_reader import (  # noqa: E402
+    CUSTOM_TEST_TYPES,
     DEFAULT_PARAM_VALUE,
     DEFAULT_THRESHOLD_N,
     TestSession,
@@ -33,11 +34,15 @@ from crush_reader import (  # noqa: E402
     compute_value,
     export_session_summary,
     is_sample_xml,
+    load_custom_test_types,
+    normalize_custom_test_type,
     parse_comma_values,
     parse_sample_xml,
     parse_sample_xml_bytes,
     parse_summary_xml_bytes,
     sanitize_filename,
+    save_custom_test_types,
+    validate_custom_test_type,
 )
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -248,6 +253,105 @@ class ComputeValueTests(unittest.TestCase):
     def test_empty_curve(self):
         v = compute_value({"y_values": []}, "ECT", 100.0)
         self.assertEqual(v["peak_force"], 0.0)
+
+    def test_unknown_type_falls_back_to_peak(self):
+        v = compute_value(self._sample(500.0), "NoSuchType", 100.0)
+        self.assertEqual(v["name"], "Peak Force")
+        self.assertEqual(v["unit"], "N")
+
+
+# ---------------------------------------------------------------------------
+#  Custom test types (registry + persistence)
+# ---------------------------------------------------------------------------
+
+
+class CustomTestTypeTests(unittest.TestCase):
+    RCT = {"name": "RCT", "param_label": "Length", "param_unit": "mm",
+           "factor": 1.0, "result_unit": "kN/m", "decimals": 2}
+
+    def tearDown(self):
+        CUSTOM_TEST_TYPES.clear()
+
+    def test_valid_type_passes_validation(self):
+        self.assertIsNone(validate_custom_test_type(self.RCT))
+
+    def test_builtin_names_are_rejected(self):
+        bad = dict(self.RCT, name="ECT")
+        self.assertIsNotNone(validate_custom_test_type(bad))
+
+    def test_blank_name_zero_factor_and_bad_decimals_are_rejected(self):
+        self.assertIsNotNone(validate_custom_test_type(dict(self.RCT, name=" ")))
+        self.assertIsNotNone(validate_custom_test_type(dict(self.RCT, factor=0)))
+        self.assertIsNotNone(validate_custom_test_type(dict(self.RCT, factor="abc")))
+        self.assertIsNotNone(validate_custom_test_type(dict(self.RCT, decimals=9)))
+
+    def test_compute_value_uses_registered_custom_type(self):
+        tt = normalize_custom_test_type(self.RCT)
+        CUSTOM_TEST_TYPES[tt["name"]] = tt
+        v = compute_value({"y_values": [0.0, 1500.0]}, "RCT", 150.0)
+        self.assertEqual(v["name"], "RCT")
+        self.assertEqual(v["unit"], "kN/m")
+        self.assertAlmostEqual(v["value"], 10.0)  # 1500 N / 150 mm
+
+    def test_custom_type_with_multiplier(self):
+        fct_in = normalize_custom_test_type(
+            {"name": "FCT-in", "param_label": "Area", "param_unit": "in²",
+             "factor": 0.2248, "result_unit": "lbf/in²", "decimals": 3})
+        CUSTOM_TEST_TYPES[fct_in["name"]] = fct_in
+        v = compute_value({"y_values": [1000.0]}, "FCT-in", 16.0)
+        self.assertAlmostEqual(v["value"], round(1000.0 * 0.2248 / 16.0, 3))
+
+    def test_save_and_load_roundtrip(self):
+        import tempfile
+
+        tt = normalize_custom_test_type(self.RCT)
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "sub" / "test_types.json"
+            save_custom_test_types({tt["name"]: tt}, p)
+            loaded = load_custom_test_types(p)
+        self.assertEqual(list(loaded), ["RCT"])
+        self.assertEqual(loaded["RCT"]["factor"], 1.0)
+        self.assertEqual(loaded["RCT"]["result_unit"], "kN/m")
+        self.assertFalse(loaded["RCT"]["builtin"])
+
+    def test_load_missing_or_corrupt_file_returns_empty(self):
+        import tempfile
+
+        self.assertEqual(load_custom_test_types(Path("Z:/nope/none.json")), {})
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "test_types.json"
+            bad.write_text("{not json", encoding="utf-8")
+            self.assertEqual(load_custom_test_types(bad), {})
+
+    def test_load_skips_invalid_entries_and_builtin_shadows(self):
+        import json as _json
+        import tempfile
+
+        payload = {"version": 1, "types": [
+            self.RCT,
+            dict(self.RCT, name="ECT"),      # would shadow a builtin
+            dict(self.RCT, name="", ),        # invalid
+            "garbage",
+        ]}
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "test_types.json"
+            p.write_text(_json.dumps(payload), encoding="utf-8")
+            loaded = load_custom_test_types(p)
+        self.assertEqual(list(loaded), ["RCT"])
+
+    def test_session_export_uses_custom_param_label(self):
+        import tempfile
+
+        tt = normalize_custom_test_type(self.RCT)
+        CUSTOM_TEST_TYPES[tt["name"]] = tt
+        s = TestSession("Custom Proj", "RCT", 152.4)
+        parsed = parse_sample_xml(SAMPLE_XML_PATH)
+        s.add_sample(parsed, SAMPLE_XML_PATH.read_bytes())
+        with tempfile.TemporaryDirectory() as tmp:
+            path = export_session_summary(s, tmp, "session_x")
+            text = path.read_text(encoding="utf-8-sig")
+        self.assertIn("Length (mm)", text)
+        self.assertIn("RCT", text)
 
 
 # ---------------------------------------------------------------------------

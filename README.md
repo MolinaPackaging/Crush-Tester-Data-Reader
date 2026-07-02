@@ -14,7 +14,8 @@ The tool connects to the crush tester over FTP, monitors for new test results in
   - **ECT** (Edge Crush Test) — computes ECT in kN/m from peak force and specimen length.
   - **FCT** (Flat Crush Test) — computes FCT in kPa from peak force and specimen area.
   - **Generic** — reports peak load in Newtons.
-- **Per-sample editing** — double-click to change specimen dimensions for individual replicates; click to include/exclude samples from analysis.
+  - **Custom test types (v4.0)** — define your own (e.g. RCT, PAT) via **Tools → Manage Test Types**. Any test of the form *Result = Peak Force × multiplier ÷ parameter* is supported; definitions are saved per-user and survive app updates.
+- **Per-sample editing** — double-click to change specimen dimensions for individual replicates; click to include/exclude samples from analysis; right-click a row for more actions (include all, exclude all others, edit parameter).
 - **Force-displacement plotting** — overlaid curves with peak markers, adjustable zeroing threshold, and matplotlib toolbar for zoom/pan/save.
 - **Batch import** — load previously saved XML files for post-hoc analysis without needing the machine connected.
 - **CSV export** — per-sample raw data and session summaries with all computed values.
@@ -26,7 +27,7 @@ The tool connects to the crush tester over FTP, monitors for new test results in
 
 ### Option A: Run the pre-built executable (lab computers)
 
-1. Download or copy `CrushReader.exe` to the lab computer.
+1. Download or copy `CrushReader_v<version>.exe` (e.g. `CrushReader_v4.0.0.exe`) to the lab computer. The version is part of the filename, so the newest build is always obvious — delete or archive older copies.
 2. Double-click to run. Windows SmartScreen may warn you the first time — click **More info → Run anyway**.
 3. That's it. No installation needed.
 
@@ -48,8 +49,8 @@ You need a Windows machine with Python 3.8+ installed. The lab computer does **n
 1. Clone or copy this folder to the machine that has Python.
 2. Run `build_exe.bat`. If you use **Anaconda/Miniconda**, run it from an *Anaconda Prompt* (or a `conda activate`d terminal) rather than double-clicking — a double-clicked script opens a fresh window where conda isn't active.
 3. Wait ~1–2 minutes. On the first run the script creates a clean, isolated build environment (`.build_venv`) containing only matplotlib + PyInstaller, then builds. Later runs reuse it and are faster.
-4. Find the result in `dist\CrushReader.exe` (~40–60 MB).
-5. Copy `CrushReader.exe` to the lab computer via USB drive or network.
+4. Find the result in `dist\CrushReader_v<version>.exe` (~40–60 MB). The version number is read from `__version__` in `crush_reader.py` automatically.
+5. Copy the `.exe` to the lab computer via USB drive or network.
 
 > **Why the isolated environment?** Building directly from a shared base env (especially Anaconda) pulls in unrelated packages that bloat or break PyInstaller — conflicting Qt bindings (`PyQt5` + `PySide6`), an obsolete `pathlib` backport, pandas/scipy, and so on. The `.build_venv` sidesteps all of that so the build is small and identical on every machine. It's safe to delete `.build_venv` anytime; it will be recreated on the next build.
 
@@ -143,7 +144,7 @@ Before connecting, make sure the lab computer is plugged into the crush tester v
 
 1. **Choose an output folder.** Click **Browse...** under "Save to:" and pick a folder where archived test data will be saved. This is required before connecting.
 2. **Check the connection settings.** The defaults (above) should work unless your machine has been reconfigured.
-3. **Click "Connect & Monitor."** The status dot turns green when connected. If it fails, check that the Ethernet cable is plugged in and the tester is powered on.
+3. **Click "Connect & Monitor."** The status pill in the top-right corner of the window turns green when connected. If it stays red, check that the Ethernet cable is plugged in and the tester is powered on.
 
 Once connected, the tool polls the tester every 5 seconds. When you run a test on the machine, the tool will detect the new data within a few seconds.
 
@@ -166,7 +167,7 @@ Click **Start Session** to begin.
 4. Compute the test-specific value (ECT, FCT, or peak force).
 5. Add the replicate to the table and update the plot.
 
-**Ending a session.** Click **New Session** to start a fresh one (you'll be prompted to export), or click **Export Summary CSV** to save the session data. Closing the application will also prompt you to export.
+**Ending a session.** Click **New Session** to start a fresh one (you'll be prompted to export), or click **Export Results** to save the session data. Closing the application will also prompt you to export. Use **Rename** in the top bar if you want to change the session name at any point.
 
 ### 4. Test types and parameters
 
@@ -175,6 +176,14 @@ Click **Start Session** to begin.
 **FCT (Flat Crush Test)** — measures flat crush resistance in **kPa**. Default parameter: specimen area in cm² (typically 100 cm² for a 10×10 cm specimen).
 
 **Generic** — reports peak load in **N** with no additional calculation. Use this when you just need the raw peak force.
+
+**Custom test types.** Open **Tools → Manage Test Types** (or the **Manage...** button next to the test-type dropdown) to create your own. Every custom type follows one formula:
+
+```
+Result = Peak Force (N) × multiplier ÷ parameter
+```
+
+You choose the name (e.g. RCT), what the parameter is (e.g. Length in mm), the multiplier (1 for N/mm → kN/m, 10 for N/cm² → kPa), the result unit, and the number of decimals. A live example in the dialog shows the math as you type. Custom types appear in every test-type dropdown, and per-sample parameter editing and exports work exactly as they do for ECT/FCT. Definitions are stored per-user in `%APPDATA%\CrushReader\test_types.json`, so they survive app updates; built-in types cannot be changed or deleted.
 
 **Changing parameters after testing.** If specimen dimensions were entered incorrectly, you can fix them without re-running tests:
 
@@ -198,7 +207,9 @@ The table shows one row per sample with these columns:
 | Computed     | Calculated ECT, FCT, or peak force value.         |
 | Unit         | Unit of the computed value.                       |
 
-Click the **Plot** column for any sample to toggle it. Excluded samples are removed from the statistics and the graph — useful for discarding outliers without deleting data. Click any row to highlight that curve on the graph.
+Click the **Plot** column for any sample to toggle it. Excluded samples are dimmed and removed from the statistics and the graph — useful for discarding outliers without deleting data. Click any row to highlight that curve on the graph.
+
+**Right-click** any row for quick actions: include/exclude, edit the parameter, include all replicates, or exclude all others (handy for inspecting one curve at a time).
 
 ### 6. Reading the plot
 
@@ -227,7 +238,7 @@ Useful for re-analyzing old data with different parameters, combining sessions, 
 
 ### 8. Exporting data
 
-**Session export (one click).** Click **Export Summary** to write a complete bundle into the session folder at once:
+**Session export (one click).** Click **Export Results** to write a complete bundle into the session folder at once:
 
 - `*_summary_*.csv` — project name, test type, date, replicate count, summary statistics (mean, std, COV, min, max), and the per-replicate table.
 - `*_alldata_*.csv` — every replicate's zeroed force-displacement curve, laid out as a Displacement/Force column pair per sample side by side (excluded replicates are included too, tagged, so no raw data is lost). Easy to re-plot in Excel.
